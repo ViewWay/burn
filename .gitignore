@@ -5,6 +5,8 @@ target
 
 .dir-locals.el
 .idea
+.lingma
+.github
 .vscode
 .vs
 .fleet
