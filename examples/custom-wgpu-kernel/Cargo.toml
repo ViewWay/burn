@@ -10,16 +10,19 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-burn = { path = "../../crates/burn", default-features = false, features = [
+burn = { workspace = true, features = [
     "autodiff",
+    "fusion",
     "wgpu",
     "autotune",
     "template",
+    "extension"
 ] }
 cubecl = { workspace = true, features = ["wgpu"] }
 
+burn-cubecl = { workspace = true, features = ["fusion"] }
+
 # Serialization
-log = { workspace = true }
 serde = { workspace = true, features = ["std", "derive"] }
 
 # Wgpu internal dependencies

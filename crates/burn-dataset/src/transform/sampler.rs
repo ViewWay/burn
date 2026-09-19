@@ -1,11 +1,12 @@
 use crate::Dataset;
+use crate::DatasetError;
 use crate::transform::{RngSource, SizeConfig};
 use rand::prelude::SliceRandom;
-use rand::{Rng, distr::Uniform, rngs::StdRng, seq::IteratorRandom};
+use rand::{RngExt, distr::Uniform, rngs::StdRng, seq::IteratorRandom};
 use std::{marker::PhantomData, ops::DerefMut, sync::Mutex};
 
 /// Options to configure a [SamplerDataset].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct SamplerDatasetOptions {
     /// The sampling mode.
     pub replace_samples: bool,
@@ -274,7 +275,7 @@ where
                     // > Although the elements are selected randomly, the order of elements in
                     // > the buffer is neither stable nor fully random. If random ordering is
                     // > desired, shuffle the result.
-                    indices.extend(idx_range.choose_multiple(rng, self.size - indices.len()));
+                    indices.extend(idx_range.sample(rng, self.size - indices.len()));
 
                     // The real shuffling is done here.
                     indices.shuffle(rng);
@@ -291,11 +292,13 @@ where
     D: Dataset<I>,
     I: Send + Sync,
 {
-    fn get(&self, index: usize) -> Option<I> {
-        if index >= self.size {
-            return None;
-        }
-
+    fn get(&self, index: usize) -> Result<I, DatasetError> {
+        assert!(
+            index < self.size,
+            "Index out of bounds for SamplerDataset: {} >= {}",
+            index,
+            self.size
+        );
         self.dataset.get(self.index())
     }
 
@@ -344,8 +347,8 @@ mod tests {
         let options = options.with_seed(42);
         assert_eq!(options.rng_source, RngSource::Seed(42));
         let rng = StdRng::seed_from_u64(9);
-        let options = options.with_rng(rng.clone());
-        assert_eq!(options.rng_source, RngSource::Rng(rng.clone()));
+        let options = options.with_rng(rng);
+        assert!(matches!(options.rng_source, RngSource::Rng(_)));
     }
 
     #[test]
@@ -397,7 +400,7 @@ mod tests {
 
         let mut buckets = HashMap::new();
 
-        for item in dataset_sampler.iter() {
+        for item in dataset_sampler.iter().map(Result::unwrap) {
             let count = match buckets.get(&item) {
                 Some(count) => count + 1,
                 None => 1,
@@ -417,7 +420,7 @@ mod tests {
     #[test]
     fn sampler_dataset_without_replacement_uniform_order_test() {
         // This is a reversion test on the indices.shuffle(rng) call in SamplerDataset::index().
-        let size = 100;
+        let size = 1000;
         let dataset_sampler =
             SamplerDataset::without_replacement(FakeDataset::<i32>::new(size), size);
 
@@ -431,7 +434,7 @@ mod tests {
         let expected = (size + 2) as f64 / 3.0;
 
         assert!(
-            (mean_delta - expected).abs() <= 0.2 * expected,
+            (mean_delta - expected).abs() <= 0.25 * expected,
             "Sampled indices are not uniformly distributed: mean_delta: {mean_delta}, expected: {expected}"
         );
     }

@@ -1,9 +1,10 @@
 use alloc::{vec, vec::Vec};
-use burn_tensor::ElementConversion;
+use burn_backend::element::{Element, ElementConversion};
 #[cfg(feature = "simd")]
-use burn_tensor::{DType, quantization::QuantValue};
+use burn_backend::{DType, quantization::QuantValue};
 use core::fmt::Debug;
-use core::{marker::PhantomData, ops::Range};
+use core::marker::PhantomData;
+use ndarray::Dimension;
 use ndarray::IntoDimension;
 use ndarray::SliceInfo;
 use ndarray::Zip;
@@ -16,12 +17,6 @@ use paste::paste;
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
 use num_traits::Float;
-
-use burn_tensor::Shape;
-use ndarray::Axis;
-use ndarray::Dim;
-use ndarray::IxDyn;
-use ndarray::SliceInfoElem;
 
 #[cfg(feature = "simd")]
 use crate::ops::simd::{
@@ -38,10 +33,19 @@ use crate::ops::simd::{
 };
 use crate::reshape;
 use crate::{
-    IntNdArrayElement, ShapeOps,
-    ops::macros::{keepdim, mean_dim, prod_dim, sum_dim},
+    FloatNdArrayElement, IntNdArrayElement, ShapeOps,
+    ops::macros::{
+        cummax_dim, cummin_dim, cumprod_dim, cumsum_dim, keepdim, mean_dim, prod_dim, sum_dim,
+    },
 };
 use crate::{SharedArray, element::NdArrayElement};
+use burn_backend::ops::unfold::calculate_unfold_shape;
+use burn_backend::{Shape, Slice};
+use ndarray::ArrayView;
+use ndarray::Axis;
+use ndarray::Dim;
+use ndarray::IxDyn;
+use ndarray::SliceInfoElem;
 
 pub struct NdArrayOps<E> {
     e: PhantomData<E>,
@@ -53,22 +57,496 @@ pub(crate) struct NdArrayMathOps<E> {
 
 impl<E> NdArrayOps<E>
 where
-    E: Copy + Debug + burn_tensor::Element,
+    E: Copy + Debug + Element + crate::AddAssignElement,
 {
-    pub fn slice(tensor: SharedArray<E>, ranges: &[Range<usize>]) -> SharedArray<E> {
-        let slices = Self::to_slice_args(ranges, tensor.shape().num_dims());
-        tensor.slice_move(slices.as_slice()).into_shared()
+    pub fn slice(tensor: ArrayView<E, IxDyn>, slices: &[Slice]) -> SharedArray<E> {
+        let slices = Self::to_slice_args_with_steps(slices, tensor.shape().num_dims());
+        tensor.slice_move(slices.as_slice()).to_shared()
     }
 
     pub fn slice_assign(
         tensor: SharedArray<E>,
-        ranges: &[Range<usize>],
+        slices: &[Slice],
         value: SharedArray<E>,
     ) -> SharedArray<E> {
-        let slices = Self::to_slice_args(ranges, tensor.shape().num_dims());
+        let slices = Self::to_slice_args_with_steps(slices, tensor.shape().num_dims());
         let mut array = tensor.into_owned();
         array.slice_mut(slices.as_slice()).assign(&value);
         array.into_shared()
+    }
+
+    pub fn mask_where(
+        tensor: SharedArray<E>,
+        mask: SharedArray<bool>,
+        source: SharedArray<E>,
+    ) -> SharedArray<E> {
+        let tensor = tensor.broadcast(mask.dim()).unwrap();
+        let source = source.broadcast(mask.dim()).unwrap();
+        Zip::from(&tensor)
+            .and(&mask)
+            .and(&source)
+            .map_collect(|&x, &mask_val, &y| if mask_val { y } else { x })
+            .into_shared()
+    }
+
+    pub fn mask_fill(tensor: SharedArray<E>, mask: SharedArray<bool>, value: E) -> SharedArray<E> {
+        // Use into_owned() instead of clone() - only copies if shared, avoids copy if unique
+        let mut output = tensor.into_owned();
+        let broadcast_mask = mask.broadcast(output.dim()).unwrap();
+        Zip::from(&mut output)
+            .and(&broadcast_mask)
+            .for_each(|out, &mask_val| {
+                if mask_val {
+                    *out = value;
+                }
+            });
+        output.into_shared()
+    }
+
+    pub fn gather<I: NdArrayElement>(
+        dim: usize,
+        mut tensor: SharedArray<E>,
+        mut indices: SharedArray<I>,
+    ) -> SharedArray<E> {
+        let ndims = tensor.shape().num_dims();
+        if dim != ndims - 1 {
+            tensor.swap_axes(ndims - 1, dim);
+            indices.swap_axes(ndims - 1, dim);
+        }
+        let (shape_tensor, shape_indices) = (tensor.shape(), indices.shape().into_shape());
+        let (size_tensor, size_index) = (shape_tensor[ndims - 1], shape_indices[ndims - 1]);
+        let batch_size = Self::gather_batch_size(shape_tensor, &shape_indices);
+
+        let indices = NdArrayOps::reshape(indices, Shape::new([batch_size, size_index]));
+        let tensor = NdArrayOps::reshape(tensor, Shape::new([batch_size, size_tensor]));
+        let mut output = Array2::from_elem((batch_size, size_index), 0.elem::<E>());
+
+        for b in 0..batch_size {
+            let indices = indices.slice(s!(b, ..));
+            for (i, index) in indices.iter().enumerate() {
+                output[[b, i]] = tensor[[b, index.elem::<i64>() as usize]];
+            }
+        }
+
+        let mut output = NdArrayOps::reshape(output.into_shared().into_dyn(), shape_indices);
+
+        if dim != ndims - 1 {
+            output.swap_axes(ndims - 1, dim);
+        }
+
+        output
+    }
+
+    pub fn scatter<I: NdArrayElement>(
+        dim: usize,
+        mut tensor: SharedArray<E>,
+        mut indices: SharedArray<I>,
+        mut value: SharedArray<E>,
+    ) -> SharedArray<E> {
+        let ndims = tensor.shape().num_dims();
+        if dim != ndims - 1 {
+            tensor.swap_axes(ndims - 1, dim);
+            indices.swap_axes(ndims - 1, dim);
+            value.swap_axes(ndims - 1, dim);
+        }
+
+        let (shape_tensor, shape_indices, shape_value) =
+            (tensor.shape().into_shape(), indices.shape(), value.shape());
+        let (size_tensor, size_index, size_value) = (
+            shape_tensor[ndims - 1],
+            shape_indices[ndims - 1],
+            shape_value[ndims - 1],
+        );
+        let batch_size = Self::gather_batch_size(&shape_tensor, shape_indices);
+
+        if shape_value != shape_indices {
+            panic!(
+                "Invalid dimension: the shape of the index tensor should be the same as the value \
+                 tensor: Index {:?} value {:?}",
+                shape_indices, shape_value
+            );
+        }
+
+        let indices = NdArrayOps::reshape(indices, Shape::new([batch_size, size_index]));
+        let value = NdArrayOps::reshape(value, Shape::new([batch_size, size_value]));
+        let mut tensor = NdArrayOps::reshape(tensor, Shape::new([batch_size, size_tensor]));
+
+        for b in 0..batch_size {
+            let indices = indices.slice(s!(b, ..));
+
+            for (i, index) in indices.iter().enumerate() {
+                let index = index.elem::<i64>() as usize;
+                tensor[[b, index]].add_assign(value[[b, i]]);
+            }
+        }
+
+        let mut output = NdArrayOps::reshape(tensor.into_shared().into_dyn(), shape_tensor);
+        if dim != ndims - 1 {
+            output.swap_axes(ndims - 1, dim);
+        }
+        output
+    }
+
+    pub fn scatter_assign<I: NdArrayElement>(
+        dim: usize,
+        mut tensor: SharedArray<E>,
+        mut indices: SharedArray<I>,
+        mut value: SharedArray<E>,
+    ) -> SharedArray<E> {
+        let ndims = tensor.shape().num_dims();
+        if dim != ndims - 1 {
+            tensor.swap_axes(ndims - 1, dim);
+            indices.swap_axes(ndims - 1, dim);
+            value.swap_axes(ndims - 1, dim);
+        }
+
+        let (shape_tensor, shape_indices, shape_value) =
+            (tensor.shape().into_shape(), indices.shape(), value.shape());
+        let (size_tensor, size_index, size_value) = (
+            shape_tensor[ndims - 1],
+            shape_indices[ndims - 1],
+            shape_value[ndims - 1],
+        );
+        let batch_size = Self::gather_batch_size(&shape_tensor, shape_indices);
+
+        if shape_value != shape_indices {
+            panic!(
+                "Invalid dimension: the shape of the index tensor should be the same as the value \
+                 tensor: Index {:?} value {:?}",
+                shape_indices, shape_value
+            );
+        }
+
+        let indices = NdArrayOps::reshape(indices, Shape::new([batch_size, size_index]));
+        let value = NdArrayOps::reshape(value, Shape::new([batch_size, size_value]));
+        let mut tensor = NdArrayOps::reshape(tensor, Shape::new([batch_size, size_tensor]));
+
+        for b in 0..batch_size {
+            let indices = indices.slice(s!(b, ..));
+
+            for (i, index) in indices.iter().enumerate() {
+                let index = index.elem::<i64>() as usize;
+                let value = value[[b, i]];
+                let out = &mut tensor[[b, index]];
+                *out = value;
+            }
+        }
+
+        let mut output = NdArrayOps::reshape(tensor.into_shared().into_dyn(), shape_tensor);
+        if dim != ndims - 1 {
+            output.swap_axes(ndims - 1, dim);
+        }
+        output
+    }
+
+    pub fn scatter_mul<I: NdArrayElement>(
+        dim: usize,
+        mut tensor: SharedArray<E>,
+        mut indices: SharedArray<I>,
+        mut value: SharedArray<E>,
+    ) -> SharedArray<E>
+    where
+        E: core::ops::Mul<Output = E>,
+    {
+        let ndims = tensor.shape().num_dims();
+        if dim != ndims - 1 {
+            tensor.swap_axes(ndims - 1, dim);
+            indices.swap_axes(ndims - 1, dim);
+            value.swap_axes(ndims - 1, dim);
+        }
+
+        let (shape_tensor, shape_indices, shape_value) =
+            (tensor.shape().into_shape(), indices.shape(), value.shape());
+        let (size_tensor, size_index, size_value) = (
+            shape_tensor[ndims - 1],
+            shape_indices[ndims - 1],
+            shape_value[ndims - 1],
+        );
+        let batch_size = Self::gather_batch_size(&shape_tensor, shape_indices);
+
+        if shape_value != shape_indices {
+            panic!(
+                "Invalid dimension: the shape of the index tensor should be the same as the value \
+                 tensor: Index {:?} value {:?}",
+                shape_indices, shape_value
+            );
+        }
+
+        let indices = NdArrayOps::reshape(indices, Shape::new([batch_size, size_index]));
+        let value = NdArrayOps::reshape(value, Shape::new([batch_size, size_value]));
+        let mut tensor = NdArrayOps::reshape(tensor, Shape::new([batch_size, size_tensor]));
+
+        for b in 0..batch_size {
+            let indices = indices.slice(s!(b, ..));
+
+            for (i, index) in indices.iter().enumerate() {
+                let index = index.elem::<i64>() as usize;
+                let out = &mut tensor[[b, index]];
+                *out = *out * value[[b, i]];
+            }
+        }
+
+        let mut output = NdArrayOps::reshape(tensor.into_shared().into_dyn(), shape_tensor);
+        if dim != ndims - 1 {
+            output.swap_axes(ndims - 1, dim);
+        }
+        output
+    }
+
+    pub fn scatter_min<I: NdArrayElement>(
+        dim: usize,
+        tensor: SharedArray<E>,
+        indices: SharedArray<I>,
+        value: SharedArray<E>,
+    ) -> SharedArray<E>
+    where
+        E: PartialOrd,
+    {
+        Self::scatter_extreme(dim, tensor, indices, value, |out, value| value < *out)
+    }
+
+    pub fn scatter_max<I: NdArrayElement>(
+        dim: usize,
+        tensor: SharedArray<E>,
+        indices: SharedArray<I>,
+        value: SharedArray<E>,
+    ) -> SharedArray<E>
+    where
+        E: PartialOrd,
+    {
+        Self::scatter_extreme(dim, tensor, indices, value, |out, value| value > *out)
+    }
+
+    /// Shared traversal for the Min/Max scatter variants. `replace` decides whether
+    /// the incoming value overwrites the destination; its comparison defines the
+    /// NaN handling, matching the `scatter_nd` Min/Max reductions.
+    fn scatter_extreme<I: NdArrayElement, F>(
+        dim: usize,
+        mut tensor: SharedArray<E>,
+        mut indices: SharedArray<I>,
+        mut value: SharedArray<E>,
+        replace: F,
+    ) -> SharedArray<E>
+    where
+        F: Fn(&E, E) -> bool,
+    {
+        let ndims = tensor.shape().num_dims();
+        if dim != ndims - 1 {
+            tensor.swap_axes(ndims - 1, dim);
+            indices.swap_axes(ndims - 1, dim);
+            value.swap_axes(ndims - 1, dim);
+        }
+
+        let (shape_tensor, shape_indices, shape_value) =
+            (tensor.shape().into_shape(), indices.shape(), value.shape());
+        let (size_tensor, size_index, size_value) = (
+            shape_tensor[ndims - 1],
+            shape_indices[ndims - 1],
+            shape_value[ndims - 1],
+        );
+        let batch_size = Self::gather_batch_size(&shape_tensor, shape_indices);
+
+        if shape_value != shape_indices {
+            panic!(
+                "scatter_min/scatter_max: the indices and value tensors must have the same shape, \
+                 but got indices {shape_indices:?} and value {shape_value:?}"
+            );
+        }
+
+        let indices = NdArrayOps::reshape(indices, Shape::new([batch_size, size_index]));
+        let value = NdArrayOps::reshape(value, Shape::new([batch_size, size_value]));
+        let mut tensor = NdArrayOps::reshape(tensor, Shape::new([batch_size, size_tensor]));
+
+        for b in 0..batch_size {
+            let indices = indices.slice(s!(b, ..));
+
+            for (i, index) in indices.iter().enumerate() {
+                let index = index.elem::<i64>() as usize;
+                let value = value[[b, i]];
+                let out = &mut tensor[[b, index]];
+                if replace(out, value) {
+                    *out = value;
+                }
+            }
+        }
+
+        let mut output = NdArrayOps::reshape(tensor.into_shared().into_dyn(), shape_tensor);
+        if dim != ndims - 1 {
+            output.swap_axes(ndims - 1, dim);
+        }
+        output
+    }
+
+    pub fn scatter_nd<I: NdArrayElement>(
+        data: SharedArray<E>,
+        indices: SharedArray<I>,
+        values: SharedArray<E>,
+        reduction: burn_backend::tensor::IndexingUpdateOp,
+    ) -> SharedArray<E>
+    where
+        E: core::ops::Mul<Output = E> + PartialOrd,
+    {
+        use burn_backend::tensor::IndexingUpdateOp;
+
+        let data_shape: Vec<usize> = data.shape().to_vec();
+        let idx_shape: Vec<usize> = indices.shape().to_vec();
+        let m = idx_shape.len();
+        let k = idx_shape[m - 1];
+
+        // Number of index tuples = product of batch dims (first M-1 dims of indices)
+        let num_indices: usize = idx_shape[..m - 1].iter().product();
+        // Size of each slice to scatter = product of data.shape[K..]
+        let slice_size: usize = data_shape[k..].iter().product();
+
+        let mut output = data.into_owned();
+        let output_flat = output
+            .as_slice_mut()
+            .expect("ndarray scatter_nd requires contiguous data");
+
+        // Flatten indices to [num_indices, K]
+        let idx_flat = indices
+            .as_slice()
+            .expect("ndarray scatter_nd requires contiguous indices");
+
+        // Flatten values to [num_indices, slice_size]
+        let val_flat = values
+            .as_slice()
+            .expect("ndarray scatter_nd requires contiguous values");
+
+        let strides: Vec<usize> = {
+            let mut s = vec![0usize; k];
+            if k > 0 {
+                s[k - 1] = slice_size;
+                for i in (0..k - 1).rev() {
+                    s[i] = s[i + 1] * data_shape[i + 1];
+                }
+            }
+            s
+        };
+
+        for n in 0..num_indices {
+            // Compute flat base offset from the K-dimensional index
+            let mut base_offset = 0usize;
+            for j in 0..k {
+                let idx_val = idx_flat[n * k + j].elem::<i64>() as usize;
+                base_offset += idx_val * strides[j];
+            }
+
+            // Apply reduction over the slice
+            let val_offset = n * slice_size;
+            match reduction {
+                IndexingUpdateOp::Assign => {
+                    output_flat[base_offset..(base_offset + slice_size)]
+                        .copy_from_slice(&val_flat[val_offset..(val_offset + slice_size)]);
+                }
+                IndexingUpdateOp::Add => {
+                    for s in 0..slice_size {
+                        output_flat[base_offset + s].add_assign(val_flat[val_offset + s]);
+                    }
+                }
+                IndexingUpdateOp::Mul => {
+                    for s in 0..slice_size {
+                        output_flat[base_offset + s] =
+                            output_flat[base_offset + s] * val_flat[val_offset + s];
+                    }
+                }
+                IndexingUpdateOp::Min => {
+                    for s in 0..slice_size {
+                        let b = val_flat[val_offset + s];
+                        if b < output_flat[base_offset + s] {
+                            output_flat[base_offset + s] = b;
+                        }
+                    }
+                }
+                IndexingUpdateOp::Max => {
+                    for s in 0..slice_size {
+                        let b = val_flat[val_offset + s];
+                        if b > output_flat[base_offset + s] {
+                            output_flat[base_offset + s] = b;
+                        }
+                    }
+                }
+            }
+        }
+
+        output.into_shared()
+    }
+
+    pub fn gather_nd<I: NdArrayElement>(
+        data: SharedArray<E>,
+        indices: SharedArray<I>,
+    ) -> SharedArray<E> {
+        let data_shape: Vec<usize> = data.shape().to_vec();
+        let idx_shape: Vec<usize> = indices.shape().to_vec();
+        let m = idx_shape.len();
+        let k = idx_shape[m - 1];
+
+        // Number of index tuples
+        let num_indices: usize = idx_shape[..m - 1].iter().product();
+        // Size of each output slice
+        let slice_size: usize = data_shape[k..].iter().product();
+
+        // Output shape: idx_shape[..m-1] ++ data_shape[k..]
+        let mut out_shape_vec: Vec<usize> = idx_shape[..m - 1].to_vec();
+        out_shape_vec.extend_from_slice(&data_shape[k..]);
+        let out_total = num_indices * slice_size;
+
+        let data_flat = data
+            .as_slice()
+            .expect("ndarray gather_nd requires contiguous data");
+
+        let idx_flat = indices
+            .as_slice()
+            .expect("ndarray gather_nd requires contiguous indices");
+
+        let strides: Vec<usize> = {
+            let mut s = vec![0usize; k];
+            if k > 0 {
+                s[k - 1] = slice_size;
+                for i in (0..k - 1).rev() {
+                    s[i] = s[i + 1] * data_shape[i + 1];
+                }
+            }
+            s
+        };
+
+        let mut output_vec: Vec<E> = vec![0.elem::<E>(); out_total];
+
+        for n in 0..num_indices {
+            let mut base_offset = 0usize;
+            for j in 0..k {
+                let idx_val = idx_flat[n * k + j].elem::<i64>() as usize;
+                base_offset += idx_val * strides[j];
+            }
+
+            let out_offset = n * slice_size;
+            output_vec[out_offset..(out_offset + slice_size)]
+                .copy_from_slice(&data_flat[base_offset..(base_offset + slice_size)]);
+        }
+
+        let out_shape = Shape::from(out_shape_vec);
+        let output = ArrayD::from_shape_vec(out_shape.as_slice(), output_vec)
+            .expect("gather_nd: shape mismatch");
+
+        output.into_shared()
+    }
+
+    fn gather_batch_size(shape_tensor: &[usize], shape_indices: &[usize]) -> usize {
+        let ndims = shape_tensor.num_dims();
+        let mut batch_size = 1;
+
+        for i in 0..ndims - 1 {
+            if shape_tensor[i] != shape_indices[i] {
+                panic!(
+                    "Unsupported dimension, only the last dimension can differ: Tensor {:?} Index \
+                     {:?}",
+                    shape_tensor, shape_indices
+                );
+            }
+            batch_size *= shape_indices[i];
+        }
+
+        batch_size
     }
 
     pub fn reshape(tensor: SharedArray<E>, shape: Shape) -> SharedArray<E> {
@@ -89,7 +567,9 @@ where
             .into_shared();
 
         // Transform column-major layout into row-major (standard) layout. (fix #1053)
-        Self::reshape(array.clone(), array.shape().into_shape())
+        // Get shape first (via reference), then pass ownership to avoid clone
+        let shape = array.shape().into_shape();
+        Self::reshape(array, shape)
     }
 
     pub fn cat(tensors: Vec<SharedArray<E>>, dim: usize) -> SharedArray<E> {
@@ -97,23 +577,47 @@ where
         Self::concatenate(&arrays, dim)
     }
 
-    fn to_slice_args(ranges: &[Range<usize>], ndims: usize) -> Vec<SliceInfoElem> {
+    #[allow(clippy::wrong_self_convention)]
+    fn to_slice_args_with_steps(
+        burn_slices: &[burn_backend::Slice],
+        ndims: usize,
+    ) -> Vec<SliceInfoElem> {
         let mut slices = vec![SliceInfoElem::NewAxis; ndims];
+
         for i in 0..ndims {
-            if i >= ranges.len() {
-                slices[i] = SliceInfoElem::Slice {
+            slices[i] = if i < burn_slices.len() {
+                let slice = &burn_slices[i];
+
+                // Check for empty range (would result in no elements)
+                if let Some(end) = slice.end
+                    && slice.start == end
+                {
+                    SliceInfoElem::Slice {
+                        start: 0,
+                        end: Some(0),
+                        step: 1,
+                    }
+                } else {
+                    // Pass slice parameters directly to ndarray
+                    // ndarray handles both positive and negative steps correctly:
+                    // - Positive step: iterates forward from start
+                    // - Negative step: iterates backward from the last element in range
+                    SliceInfoElem::Slice {
+                        start: slice.start,
+                        end: slice.end,
+                        step: slice.step,
+                    }
+                }
+            } else {
+                // Dimension not specified in slices - use full range
+                SliceInfoElem::Slice {
                     start: 0,
                     end: None,
                     step: 1,
                 }
-            } else {
-                slices[i] = SliceInfoElem::Slice {
-                    start: ranges[i].start as isize,
-                    end: Some(ranges[i].end as isize),
-                    step: 1,
-                }
             }
         }
+
         slices
     }
 
@@ -130,7 +634,7 @@ where
     /// Broadcasts the tensor to the given shape
     pub(crate) fn expand(tensor: SharedArray<E>, shape: Shape) -> SharedArray<E> {
         tensor
-            .broadcast(shape.dims.into_dimension())
+            .broadcast(shape.into_dimension())
             .expect("The shapes should be broadcastable")
             // need to convert view to owned array because NdArrayTensor expects owned array
             // and try_into_owned_nocopy() panics for broadcasted arrays (zero strides)
@@ -159,6 +663,58 @@ where
         let slice_info =
             SliceInfo::<Vec<SliceInfoElem>, IxDyn, IxDyn>::try_from(slice_items).unwrap();
         tensor.slice(slice_info).into_owned().into_shared()
+    }
+
+    /// Unfold windows along a dimension.
+    ///
+    /// # Warning
+    ///
+    /// This is a copy impl; `ndarray` doesn't expose the layout machinery
+    /// necessary to build the stride view.
+    ///
+    /// Returns a copy of the tensor with all complete windows of size `size` in dimension `dim`;
+    /// where windows are advanced by `step` at each index.
+    ///
+    /// The number of windows is `0` when `shape[dim] < size`, and otherwise
+    /// `(shape[dim] - size) / step + 1`.
+    ///
+    /// # Arguments
+    ///
+    /// * `tensor` - The input tensor to unfold; of shape ``[pre=..., dim shape, post=...]``
+    /// * `dim` - the dimension to unfold.
+    /// * `size` - the size of each unfolded window.
+    /// * `step` - the step between each window.
+    ///
+    /// # Returns
+    ///
+    /// A tensor view with shape ``[pre=..., windows, post=..., size]``.
+    #[allow(unused)]
+    pub(crate) fn unfold(
+        tensor: SharedArray<E>,
+        dim: usize,
+        size: usize,
+        step: usize,
+    ) -> SharedArray<E> {
+        let result_shape = calculate_unfold_shape(tensor.shape(), dim, size, step);
+        let windows = result_shape[dim];
+
+        let mut slices = vec![Slice::new(0, None, 1); tensor.shape().len()];
+        let new_axis = slices.len();
+
+        let mut stack = Vec::with_capacity(windows);
+        for widx in 0..windows {
+            let start = widx * step;
+            let end = start + size;
+            slices[dim] = Slice::new(start as isize, Some(end as isize), 1);
+
+            let mut window_slice =
+                tensor.slice(Self::to_slice_args_with_steps(&slices, slices.len()).as_slice());
+            window_slice.insert_axis_inplace(Axis(new_axis));
+            window_slice.swap_axes(dim, new_axis);
+
+            stack.push(window_slice);
+        }
+        Self::concatenate(&stack, dim)
     }
 }
 
@@ -220,7 +776,7 @@ macro_rules! dispatch_binary_scalar_simd {
                 $(DType::[<$ty:upper>] => try_binary_scalar_simd::<$elem, $elem, $ty, $ty, $op>($lhs, $rhs),)*
                 DType::QFloat(strategy) => match strategy.value {
                     QuantValue::Q8F | QuantValue::Q8S => try_binary_scalar_simd::<$elem, $elem, i8, i8, $op>($lhs, $rhs),
-                    QuantValue::Q4F | QuantValue::Q4S | QuantValue::Q2F | QuantValue::Q2S => Err($lhs)
+                    QuantValue::Q4F | QuantValue::Q4S | QuantValue::Q2F | QuantValue::Q2S | QuantValue::E4M3 | QuantValue::E5M2 | QuantValue::E2M1 => Err($lhs)
                 },
                 _ => Err($lhs),
             };
@@ -246,7 +802,7 @@ macro_rules! dispatch_cmp_simd {
                 $(DType::[<$ty:upper>] => try_cmp_simd::<$elem, $ty, $op>($lhs, $rhs),)*
                 DType::QFloat(strategy) => match strategy.value {
                     QuantValue::Q8F | QuantValue::Q8S => try_cmp_simd::<$elem, i8, $op>($lhs, $rhs),
-                    QuantValue::Q4F | QuantValue::Q4S | QuantValue::Q2F | QuantValue::Q2S => Err(($lhs, $rhs))
+                    QuantValue::Q4F | QuantValue::Q4S | QuantValue::Q2F | QuantValue::Q2S | QuantValue::E4M3 | QuantValue::E5M2 | QuantValue::E2M1 => Err(($lhs, $rhs))
                 },
                 _ => Err(($lhs, $rhs)),
             };
@@ -271,7 +827,7 @@ macro_rules! dispatch_cmp_scalar_simd {
                 $(DType::[<$ty:upper>] => try_cmp_scalar_simd::<$elem, $ty, $op>($lhs, $rhs),)*
                 DType::QFloat(strategy) => match strategy.value {
                     QuantValue::Q8F | QuantValue::Q8S => try_cmp_scalar_simd::<$elem, i8, $op>($lhs, $rhs),
-                    QuantValue::Q4F | QuantValue::Q4S | QuantValue::Q2F | QuantValue::Q2S => Err($lhs)
+                    QuantValue::Q4F | QuantValue::Q4S | QuantValue::Q2F | QuantValue::Q2S | QuantValue::E4M3 | QuantValue::E5M2 | QuantValue::E2M1 => Err($lhs)
                 },
                 _ => Err($lhs),
             };
@@ -309,9 +865,9 @@ macro_rules! dispatch_unary_simd {
     ($elem: ty, $op: ty, $lhs: expr, $($ty: ty),*) => {{ $lhs }};
 }
 
-// Helper function to broadcast two tensors to a common shape for comparison operations
+// Helper function to broadcast two tensors to a common shape for binary operations
 // Returns broadcasted views that can be safely zipped
-fn broadcast_for_comparison<'a, E: Copy, S1, S2>(
+fn broadcast_for_binary_ops<'a, E: Copy, S1, S2>(
     lhs: &'a ndarray::ArrayBase<S1, ndarray::IxDyn>,
     rhs: &'a ndarray::ArrayBase<S2, ndarray::IxDyn>,
 ) -> (
@@ -368,6 +924,35 @@ where
         .expect("Failed to broadcast rhs");
 
     (lhs_broadcast, rhs_broadcast)
+}
+
+/// The mean of zero elements, which is `0 / 0`.
+///
+/// `NaN` for a float, matching numpy and torch. Integers have no such value, so an integer mean of
+/// nothing is rejected rather than silently reported as some other number.
+pub(crate) fn empty_mean<E: NdArrayElement>() -> E {
+    assert!(
+        E::dtype().is_float(),
+        "Cannot compute mean of empty tensor for the integer type {:?}",
+        E::dtype()
+    );
+    0.elem::<E>() / 0.elem::<E>()
+}
+
+/// Python/PyTorch-style remainder: result has same sign as divisor.
+#[inline]
+fn remainder<E: NdArrayElement + PartialOrd>(a: E, b: E) -> E {
+    let zero = 0.elem::<E>();
+    // Any signed integer modulo -1 is zero, including MIN % -1.
+    if E::dtype().is_int() && b == zero - 1.elem::<E>() {
+        return zero;
+    }
+    let r = a % b;
+    if r != zero && (r < zero) != (b < zero) {
+        r + b
+    } else {
+        r
+    }
 }
 
 impl<E> NdArrayMathOps<E>
@@ -477,18 +1062,25 @@ where
         array.into_shared()
     }
 
-    pub fn remainder(lhs: SharedArray<E>, rhs: SharedArray<E>) -> SharedArray<E> {
-        let array =
-            lhs.clone() - (lhs / rhs.clone()).mapv_into(|a| (a.to_f64()).floor().elem()) * rhs;
-        array.into_shared()
+    pub fn remainder(lhs: SharedArray<E>, rhs: SharedArray<E>) -> SharedArray<E>
+    where
+        E: PartialOrd,
+    {
+        // Python/PyTorch-style remainder: result has same sign as divisor
+        let (lhs, rhs) = broadcast_for_binary_ops(&lhs, &rhs);
+
+        Zip::from(&lhs)
+            .and(&rhs)
+            .map_collect(|&a, &b| remainder(a, b))
+            .into_shared()
     }
 
     pub fn remainder_scalar(lhs: SharedArray<E>, rhs: E) -> SharedArray<E>
     where
-        E: core::ops::Rem<Output = E>,
+        E: PartialOrd,
     {
-        let array = lhs.mapv(|x| ((x % rhs) + rhs) % rhs);
-        array.into_shared()
+        // Python/PyTorch-style remainder: result has same sign as divisor
+        lhs.mapv(|x| remainder(x, rhs)).into_shared()
     }
 
     pub fn recip(tensor: SharedArray<E>) -> SharedArray<E> {
@@ -498,18 +1090,22 @@ where
         array.into_shared()
     }
 
-    pub fn mean(tensor: SharedArray<E>) -> SharedArray<E> {
-        let mean = tensor.mean().unwrap();
-        ArrayD::from_elem(IxDyn(&[1]), mean).into_shared()
-    }
-
-    pub fn sum(tensor: SharedArray<E>) -> SharedArray<E> {
-        let sum = tensor.sum();
+    /// Sum all elements - zero-copy for borrowed storage.
+    pub fn sum_view(view: ArrayView<'_, E, IxDyn>) -> SharedArray<E> {
+        let sum = view.sum();
         ArrayD::from_elem(IxDyn(&[1]), sum).into_shared()
     }
 
-    pub fn prod(tensor: SharedArray<E>) -> SharedArray<E> {
-        let prod = tensor.product();
+    /// Mean of all elements - zero-copy for borrowed storage.
+    pub fn mean_view(view: ArrayView<'_, E, IxDyn>) -> SharedArray<E> {
+        // `ndarray::mean` returns `None` for an empty view.
+        let mean = view.mean().unwrap_or_else(empty_mean);
+        ArrayD::from_elem(IxDyn(&[1]), mean).into_shared()
+    }
+
+    /// Product of all elements - zero-copy for borrowed storage.
+    pub fn prod_view(view: ArrayView<'_, E, IxDyn>) -> SharedArray<E> {
+        let prod = view.iter().fold(E::one(), |acc, &x| acc * x);
         ArrayD::from_elem(IxDyn(&[1]), prod).into_shared()
     }
 
@@ -537,133 +1133,12 @@ where
         }
     }
 
-    pub fn gather<I: NdArrayElement>(
-        dim: usize,
-        mut tensor: SharedArray<E>,
-        mut indices: SharedArray<I>,
-    ) -> SharedArray<E> {
-        let ndims = tensor.shape().num_dims();
-        if dim != ndims - 1 {
-            tensor.swap_axes(ndims - 1, dim);
-            indices.swap_axes(ndims - 1, dim);
-        }
-        let (shape_tensor, shape_indices) = (tensor.shape(), indices.shape().into_shape());
-        let (size_tensor, size_index) = (shape_tensor[ndims - 1], shape_indices.dims[ndims - 1]);
-        let batch_size = Self::gather_batch_size(shape_tensor, &shape_indices.dims);
-
-        let indices = NdArrayOps::reshape(indices, Shape::new([batch_size, size_index]));
-        let tensor = NdArrayOps::reshape(tensor, Shape::new([batch_size, size_tensor]));
-        let mut output = Array2::zeros((batch_size, size_index));
-
-        for b in 0..batch_size {
-            let indices = indices.slice(s!(b, ..));
-            for (i, index) in indices.iter().enumerate() {
-                output[[b, i]] = tensor[[b, index.elem::<i64>() as usize]];
-            }
-        }
-
-        let mut output = NdArrayOps::reshape(output.into_shared().into_dyn(), shape_indices);
-
-        if dim != ndims - 1 {
-            output.swap_axes(ndims - 1, dim);
-        }
-
-        output
+    pub fn cumsum(tensor: SharedArray<E>, dim: usize) -> SharedArray<E> {
+        cumsum_dim(tensor, dim)
     }
 
-    pub fn scatter<I: NdArrayElement>(
-        dim: usize,
-        mut tensor: SharedArray<E>,
-        mut indices: SharedArray<I>,
-        mut value: SharedArray<E>,
-    ) -> SharedArray<E> {
-        let ndims = tensor.shape().num_dims();
-        if dim != ndims - 1 {
-            tensor.swap_axes(ndims - 1, dim);
-            indices.swap_axes(ndims - 1, dim);
-            value.swap_axes(ndims - 1, dim);
-        }
-
-        let (shape_tensor, shape_indices, shape_value) =
-            (tensor.shape().into_shape(), indices.shape(), value.shape());
-        let (size_tensor, size_index, size_value) = (
-            shape_tensor.dims[ndims - 1],
-            shape_indices[ndims - 1],
-            shape_value[ndims - 1],
-        );
-        let batch_size = Self::gather_batch_size(&shape_tensor.dims, shape_indices);
-
-        if shape_value != shape_indices {
-            panic!(
-                "Invalid dimension: the shape of the index tensor should be the same as the value \
-                 tensor: Index {:?} value {:?}",
-                shape_indices, shape_value
-            );
-        }
-
-        let indices = NdArrayOps::reshape(indices, Shape::new([batch_size, size_index]));
-        let value = NdArrayOps::reshape(value, Shape::new([batch_size, size_value]));
-        let mut tensor = NdArrayOps::reshape(tensor, Shape::new([batch_size, size_tensor]));
-
-        for b in 0..batch_size {
-            let indices = indices.slice(s!(b, ..));
-
-            for (i, index) in indices.iter().enumerate() {
-                let index = index.elem::<i64>() as usize;
-                tensor[[b, index]] += value[[b, i]];
-            }
-        }
-
-        let mut output = NdArrayOps::reshape(tensor.into_shared().into_dyn(), shape_tensor);
-        if dim != ndims - 1 {
-            output.swap_axes(ndims - 1, dim);
-        }
-        output
-    }
-
-    pub fn mask_where(
-        tensor: SharedArray<E>,
-        mask: SharedArray<bool>,
-        source: SharedArray<E>,
-    ) -> SharedArray<E> {
-        let tensor = tensor.broadcast(mask.dim()).unwrap();
-        let source = source.broadcast(mask.dim()).unwrap();
-        Zip::from(&tensor)
-            .and(&mask)
-            .and(&source)
-            .map_collect(|&x, &mask_val, &y| if mask_val { y } else { x })
-            .into_shared()
-    }
-
-    pub fn mask_fill(tensor: SharedArray<E>, mask: SharedArray<bool>, value: E) -> SharedArray<E> {
-        let mut output = tensor.clone();
-        let broadcast_mask = mask.broadcast(output.dim()).unwrap();
-        Zip::from(&mut output)
-            .and(&broadcast_mask)
-            .for_each(|out, &mask_val| {
-                if mask_val {
-                    *out = value;
-                }
-            });
-        output.into_shared()
-    }
-
-    fn gather_batch_size(shape_tensor: &[usize], shape_indices: &[usize]) -> usize {
-        let ndims = shape_tensor.num_dims();
-        let mut batch_size = 1;
-
-        for i in 0..ndims - 1 {
-            if shape_tensor[i] != shape_indices[i] {
-                panic!(
-                    "Unsupported dimension, only the last dimension can differ: Tensor {:?} Index \
-                     {:?}",
-                    shape_tensor, shape_indices
-                );
-            }
-            batch_size *= shape_indices[i];
-        }
-
-        batch_size
+    pub fn cumprod(tensor: SharedArray<E>, dim: usize) -> SharedArray<E> {
+        cumprod_dim(tensor, dim)
     }
 
     pub fn select<I: NdArrayElement>(
@@ -671,10 +1146,19 @@ where
         dim: usize,
         indices: SharedArray<I>,
     ) -> SharedArray<E> {
+        // Read the indices from a contiguous slice rather than through the
+        // array's own iterator: the slice walks a pointer, while the
+        // iterator advances a dynamic-rank index on every element and costs
+        // more than the selection itself. The standardization is a view, and
+        // hence free, for contiguous indices; otherwise, it pays that
+        // iteration once, which the direct consumption would pay anyway.
+        let indices = indices.as_standard_layout();
         let array = tensor.select(
             Axis(dim),
             &indices
-                .into_iter()
+                .as_slice()
+                .unwrap()
+                .iter()
                 .map(|i| i.elem::<i64>() as usize)
                 .collect::<Vec<_>>(),
         );
@@ -699,11 +1183,353 @@ where
 
         output_array.into_shared()
     }
-    pub fn argmax<I: NdArrayElement>(tensor: SharedArray<E>, dim: usize) -> SharedArray<I> {
+
+    pub fn select_assign_replace<I: NdArrayElement>(
+        tensor: SharedArray<E>,
+        dim: usize,
+        indices: SharedArray<I>,
+        value: SharedArray<E>,
+    ) -> SharedArray<E> {
+        let mut output_array = tensor.into_owned();
+
+        for (index_value, index) in indices.into_iter().enumerate() {
+            let mut view = output_array.index_axis_mut(Axis(dim), index.elem::<i64>() as usize);
+            let value = value.index_axis(Axis(dim), index_value);
+
+            view.zip_mut_with(&value, |a, b| *a = *b);
+        }
+
+        output_array.into_shared()
+    }
+
+    pub fn select_assign_mul<I: NdArrayElement>(
+        tensor: SharedArray<E>,
+        dim: usize,
+        indices: SharedArray<I>,
+        value: SharedArray<E>,
+    ) -> SharedArray<E> {
+        let mut output_array = tensor.into_owned();
+
+        for (index_value, index) in indices.into_iter().enumerate() {
+            let mut view = output_array.index_axis_mut(Axis(dim), index.elem::<i64>() as usize);
+            let value = value.index_axis(Axis(dim), index_value);
+
+            view.zip_mut_with(&value, |a, b| *a = *a * *b);
+        }
+
+        output_array.into_shared()
+    }
+
+    pub fn select_assign_min<I: NdArrayElement>(
+        tensor: SharedArray<E>,
+        dim: usize,
+        indices: SharedArray<I>,
+        value: SharedArray<E>,
+    ) -> SharedArray<E>
+    where
+        E: PartialOrd,
+    {
+        Self::select_assign_extreme(tensor, dim, indices, value, |a, b| *b < *a)
+    }
+
+    pub fn select_assign_max<I: NdArrayElement>(
+        tensor: SharedArray<E>,
+        dim: usize,
+        indices: SharedArray<I>,
+        value: SharedArray<E>,
+    ) -> SharedArray<E>
+    where
+        E: PartialOrd,
+    {
+        Self::select_assign_extreme(tensor, dim, indices, value, |a, b| *b > *a)
+    }
+
+    /// Shared traversal for the Min/Max select_assign variants. `replace` decides
+    /// whether the incoming value overwrites the destination; its comparison defines
+    /// the NaN handling.
+    fn select_assign_extreme<I: NdArrayElement, F>(
+        tensor: SharedArray<E>,
+        dim: usize,
+        indices: SharedArray<I>,
+        value: SharedArray<E>,
+        replace: F,
+    ) -> SharedArray<E>
+    where
+        F: Fn(&mut E, &E) -> bool,
+    {
+        let ndims = tensor.shape().num_dims();
+        assert!(
+            dim < ndims,
+            "select_assign_min/select_assign_max: dim {dim} is out of bounds for a {ndims}-D tensor"
+        );
+        assert_eq!(
+            indices.shape().num_dims(),
+            1,
+            "select_assign_min/select_assign_max: indices must be 1D, got shape {:?}",
+            indices.shape()
+        );
+        assert_eq!(
+            value.shape().num_dims(),
+            ndims,
+            "select_assign_min/select_assign_max: value rank ({}) must match tensor rank ({ndims})",
+            value.shape().num_dims()
+        );
+        assert_eq!(
+            value.shape()[dim],
+            indices.shape()[0],
+            "select_assign_min/select_assign_max: value dim {dim} ({}) must equal the number of \
+             indices ({})",
+            value.shape()[dim],
+            indices.shape()[0]
+        );
+
+        let mut output_array = tensor.into_owned();
+
+        for (index_value, index) in indices.into_iter().enumerate() {
+            let mut view = output_array.index_axis_mut(Axis(dim), index.elem::<i64>() as usize);
+            let value = value.index_axis(Axis(dim), index_value);
+
+            view.zip_mut_with(&value, |a, b| {
+                if replace(a, b) {
+                    *a = *b;
+                }
+            });
+        }
+
+        output_array.into_shared()
+    }
+
+    fn broadcast_dims<D>(lhs: D::Pattern, rhs: D::Pattern) -> Option<D::Pattern>
+    where
+        D: Dimension + IntoDimension<Dim = D>,
+    {
+        if lhs == rhs {
+            Some(lhs)
+        } else {
+            let lhs = lhs.into_dimension();
+            let rhs = rhs.into_dimension();
+            let lhs = lhs.slice();
+            let rhs = rhs.slice();
+
+            let total_dims = core::cmp::max(lhs.len(), rhs.len());
+            let mut target_shape = vec![0; total_dims];
+            // Iterate backwards (from the trailing dimensions inward)
+            for i in 0..total_dims {
+                let lhs_dim = lhs
+                    .len()
+                    .checked_sub(1 + i)
+                    .map(|idx| lhs[idx])
+                    .unwrap_or(1);
+                let rhs_dim = rhs
+                    .len()
+                    .checked_sub(1 + i)
+                    .map(|idx| rhs[idx])
+                    .unwrap_or(1);
+
+                if lhs_dim == rhs_dim {
+                    target_shape[total_dims - 1 - i] = lhs_dim;
+                } else if lhs_dim == 1 {
+                    target_shape[total_dims - 1 - i] = rhs_dim;
+                } else if rhs_dim == 1 {
+                    target_shape[total_dims - 1 - i] = lhs_dim;
+                } else {
+                    // Dimensions are completely incompatible (e.g., trying to match 3 and 5)
+                    return None;
+                }
+            }
+
+            let dyn_dim = IxDyn(&target_shape);
+            D::Dim::from_dimension(&dyn_dim).map(|d| d.into_pattern())
+        }
+    }
+
+    pub(crate) fn elementwise_op<OtherE>(
+        lhs: SharedArray<E>,
+        rhs: SharedArray<OtherE>,
+        var_name: impl FnMut(&E, &OtherE) -> E,
+    ) -> SharedArray<E> {
+        if let Some(target) = Self::broadcast_dims::<IxDyn>(lhs.dim(), rhs.dim()) {
+            let lhs = lhs.broadcast(target.clone()).unwrap();
+            let rhs = rhs.broadcast(target).unwrap();
+
+            Zip::from(lhs).and(rhs).map_collect(var_name).into_shared()
+        } else {
+            panic!(
+                "Incompatible shapes for broadcasting: {:?} and {:?}",
+                lhs.shape(),
+                rhs.shape()
+            );
+        }
+    }
+
+    pub(crate) fn elementwise_op_scalar(
+        lhs: SharedArray<E>,
+        var_name: impl FnMut(E) -> E,
+    ) -> SharedArray<E> {
+        lhs.mapv(var_name).into_shared()
+    }
+
+    pub(crate) fn abs(tensor: SharedArray<E>) -> SharedArray<E> {
+        let tensor = dispatch_unary_simd!(E, VecAbs, tensor, i8, i16, i32, f32, f64);
+
+        tensor.mapv_into(|a| a.abs_elem()).into_shared()
+    }
+
+    pub(crate) fn equal(lhs: SharedArray<E>, rhs: SharedArray<E>) -> SharedArray<bool> {
+        let (lhs, rhs) = dispatch_cmp_simd!(
+            E, VecEquals, lhs, rhs, u8, i8, u16, i16, u32, f32, i32, u64, i64, f64
+        );
+
+        // Use the helper to broadcast both arrays to a common shape
+        let (lhs_broadcast, rhs_broadcast) = broadcast_for_binary_ops(&lhs, &rhs);
+        // Now we can safely zip and compare
+        Zip::from(&lhs_broadcast)
+            .and(&rhs_broadcast)
+            .map_collect(|&lhs, &rhs| lhs == rhs)
+            .into_shared()
+    }
+
+    pub(crate) fn equal_elem(lhs: SharedArray<E>, rhs: E) -> SharedArray<bool> {
+        let lhs = dispatch_cmp_scalar_simd!(
+            E,
+            VecEquals,
+            lhs,
+            rhs.elem(),
+            u8,
+            i8,
+            u16,
+            i16,
+            u32,
+            f32,
+            i32,
+            u64,
+            i64,
+            f64
+        );
+
+        lhs.mapv(|a| a == rhs).into_shared()
+    }
+
+    pub(crate) fn sign_op(tensor: SharedArray<E>) -> SharedArray<E>
+    where
+        // `PartialOrd` in addition to the enclosing impl block's bounds:
+        // needed for the numeric bound comparisons.
+        E: Signed + PartialOrd,
+    {
+        let zero = 0.elem();
+        let one = 1.elem::<E>();
+
+        tensor
+            .mapv(|x| {
+                if x > zero {
+                    one
+                } else if x < zero {
+                    -one
+                } else {
+                    zero
+                }
+            })
+            .into_shared()
+    }
+}
+
+impl<E> NdArrayMathOps<E>
+where
+    E: Copy + NdArrayElement + PartialOrd,
+{
+    /// Max of all elements - zero-copy for borrowed storage.
+    pub fn max_view(view: ArrayView<'_, E, IxDyn>) -> SharedArray<E> {
+        let max = view
+            .iter()
+            .copied()
+            .reduce(|a, b| if a > b { a } else { b })
+            .expect("Cannot compute max of empty tensor");
+        ArrayD::from_elem(IxDyn(&[1]), max).into_shared()
+    }
+
+    /// Max of all floating-point elements with NaN propagation.
+    pub fn max_float_view(view: ArrayView<'_, E, IxDyn>) -> SharedArray<E>
+    where
+        E: FloatNdArrayElement,
+    {
+        let max = view
+            .iter()
+            .copied()
+            .reduce(|a, b| {
+                if a.partial_cmp(&a).is_none() || a > b {
+                    a
+                } else {
+                    b
+                }
+            })
+            .expect("Cannot compute max of empty tensor");
+        ArrayD::from_elem(IxDyn(&[1]), max).into_shared()
+    }
+
+    /// Min of all elements - zero-copy for borrowed storage.
+    pub fn min_view(view: ArrayView<'_, E, IxDyn>) -> SharedArray<E> {
+        let min = view
+            .iter()
+            .copied()
+            .reduce(|a, b| if a < b { a } else { b })
+            .expect("Cannot compute min of empty tensor");
+        ArrayD::from_elem(IxDyn(&[1]), min).into_shared()
+    }
+
+    /// Min of all floating-point elements with NaN propagation.
+    pub fn min_float_view(view: ArrayView<'_, E, IxDyn>) -> SharedArray<E>
+    where
+        E: FloatNdArrayElement,
+    {
+        let min = view
+            .iter()
+            .copied()
+            .reduce(|a, b| {
+                if a.partial_cmp(&a).is_none() || a < b {
+                    a
+                } else {
+                    b
+                }
+            })
+            .expect("Cannot compute min of empty tensor");
+        ArrayD::from_elem(IxDyn(&[1]), min).into_shared()
+    }
+
+    /// Argmax along dimension - zero-copy for borrowed storage.
+    pub fn argmax_view<I: NdArrayElement + PartialOrd>(
+        view: ArrayView<'_, E, IxDyn>,
+        dim: usize,
+    ) -> SharedArray<I> {
+        arg_view(view, dim, CmpType::Max)
+    }
+
+    /// Argmin along dimension - zero-copy for borrowed storage.
+    pub fn argmin_view<I: NdArrayElement + PartialOrd>(
+        view: ArrayView<'_, E, IxDyn>,
+        dim: usize,
+    ) -> SharedArray<I> {
+        arg_view(view, dim, CmpType::Min)
+    }
+
+    pub fn cummin(tensor: SharedArray<E>, dim: usize) -> SharedArray<E> {
+        cummin_dim(tensor, dim)
+    }
+
+    pub fn cummax(tensor: SharedArray<E>, dim: usize) -> SharedArray<E> {
+        cummax_dim(tensor, dim)
+    }
+
+    pub fn argmax<I: NdArrayElement + PartialOrd>(
+        tensor: SharedArray<E>,
+        dim: usize,
+    ) -> SharedArray<I> {
         arg(tensor, dim, CmpType::Max)
     }
 
-    pub fn argmin<I: NdArrayElement>(tensor: SharedArray<E>, dim: usize) -> SharedArray<I> {
+    pub fn argmin<I: NdArrayElement + PartialOrd>(
+        tensor: SharedArray<E>,
+        dim: usize,
+    ) -> SharedArray<I> {
         arg(tensor, dim, CmpType::Min)
     }
 
@@ -788,92 +1614,13 @@ where
         tensor
     }
 
-    pub(crate) fn elementwise_op<OtherE>(
-        lhs: SharedArray<E>,
-        rhs: SharedArray<OtherE>,
-        var_name: impl FnMut(&E, &OtherE) -> E,
-    ) -> SharedArray<E> {
-        let lhs = lhs.broadcast(rhs.dim()).unwrap_or(lhs.view());
-        let rhs = rhs.broadcast(lhs.dim()).unwrap_or(rhs.view());
-
-        Zip::from(lhs).and(rhs).map_collect(var_name).into_shared()
-    }
-
-    pub(crate) fn elementwise_op_scalar(
-        lhs: SharedArray<E>,
-        var_name: impl FnMut(E) -> E,
-    ) -> SharedArray<E> {
-        lhs.mapv(var_name).into_shared()
-    }
-
-    pub(crate) fn sign_op(tensor: SharedArray<E>) -> SharedArray<E>
-    where
-        E: Signed,
-    {
-        let zero = 0.elem();
-        let one = 1.elem::<E>();
-
-        tensor
-            .mapv(|x| {
-                if x > zero {
-                    one
-                } else if x < zero {
-                    -one
-                } else {
-                    zero
-                }
-            })
-            .into_shared()
-    }
-
-    pub(crate) fn abs(tensor: SharedArray<E>) -> SharedArray<E> {
-        let tensor = dispatch_unary_simd!(E, VecAbs, tensor, i8, i16, i32, f32, f64);
-
-        tensor.mapv_into(|a| a.abs_elem()).into_shared()
-    }
-
-    pub(crate) fn equal(lhs: SharedArray<E>, rhs: SharedArray<E>) -> SharedArray<bool> {
-        let (lhs, rhs) = dispatch_cmp_simd!(
-            E, VecEquals, lhs, rhs, u8, i8, u16, i16, u32, f32, i32, u64, i64, f64
-        );
-
-        // Use the helper to broadcast both arrays to a common shape
-        let (lhs_broadcast, rhs_broadcast) = broadcast_for_comparison(&lhs, &rhs);
-        // Now we can safely zip and compare
-        Zip::from(&lhs_broadcast)
-            .and(&rhs_broadcast)
-            .map_collect(|&lhs, &rhs| lhs == rhs)
-            .into_shared()
-    }
-
-    pub(crate) fn equal_elem(lhs: SharedArray<E>, rhs: E) -> SharedArray<bool> {
-        let lhs = dispatch_cmp_scalar_simd!(
-            E,
-            VecEquals,
-            lhs,
-            rhs.elem(),
-            u8,
-            i8,
-            u16,
-            i16,
-            u32,
-            f32,
-            i32,
-            u64,
-            i64,
-            f64
-        );
-
-        lhs.mapv(|a| a == rhs).into_shared()
-    }
-
     pub(crate) fn greater(lhs: SharedArray<E>, rhs: SharedArray<E>) -> SharedArray<bool> {
         let (lhs, rhs) = dispatch_cmp_simd!(
             E, VecGreater, lhs, rhs, u8, i8, u16, i16, u32, f32, i32, u64, i64, f64
         );
 
         // Use the helper to broadcast both arrays to a common shape
-        let (lhs_broadcast, rhs_broadcast) = broadcast_for_comparison(&lhs, &rhs);
+        let (lhs_broadcast, rhs_broadcast) = broadcast_for_binary_ops(&lhs, &rhs);
         // Now we can safely zip and compare
         Zip::from(&lhs_broadcast)
             .and(&rhs_broadcast)
@@ -921,7 +1668,7 @@ where
         );
 
         // Use the helper to broadcast both arrays to a common shape
-        let (lhs_broadcast, rhs_broadcast) = broadcast_for_comparison(&lhs, &rhs);
+        let (lhs_broadcast, rhs_broadcast) = broadcast_for_binary_ops(&lhs, &rhs);
         // Now we can safely zip and compare
         Zip::from(&lhs_broadcast)
             .and(&rhs_broadcast)
@@ -956,7 +1703,7 @@ where
         );
 
         // Use the helper to broadcast both arrays to a common shape
-        let (lhs_broadcast, rhs_broadcast) = broadcast_for_comparison(&lhs, &rhs);
+        let (lhs_broadcast, rhs_broadcast) = broadcast_for_binary_ops(&lhs, &rhs);
         // Now we can safely zip and compare
         Zip::from(&lhs_broadcast)
             .and(&rhs_broadcast)
@@ -991,7 +1738,7 @@ where
         );
 
         // Use the helper to broadcast both arrays to a common shape
-        let (lhs_broadcast, rhs_broadcast) = broadcast_for_comparison(&lhs, &rhs);
+        let (lhs_broadcast, rhs_broadcast) = broadcast_for_binary_ops(&lhs, &rhs);
 
         // Now we can safely zip and compare
         Zip::from(&lhs_broadcast)
@@ -1136,12 +1883,22 @@ impl NdArrayBoolOps {
         };
 
         // Use the helper to broadcast both arrays to a common shape
-        let (lhs_broadcast, rhs_broadcast) = broadcast_for_comparison(&lhs, &rhs);
+        let (lhs_broadcast, rhs_broadcast) = broadcast_for_binary_ops(&lhs, &rhs);
         // Now we can safely zip and compare
         Zip::from(&lhs_broadcast)
             .and(&rhs_broadcast)
             .map_collect(|&lhs, &rhs| lhs == rhs)
             .into_shared()
+    }
+
+    pub(crate) fn equal_elem(lhs: SharedArray<bool>, rhs: bool) -> SharedArray<bool> {
+        #[cfg(feature = "simd")]
+        let lhs = match try_cmp_scalar_simd::<bool, u8, VecEquals>(lhs, rhs.elem()) {
+            Ok(out) => return out,
+            Err(args) => args,
+        };
+
+        lhs.mapv(|a| a == rhs).into_shared()
     }
 
     pub(crate) fn and(lhs: SharedArray<bool>, rhs: SharedArray<bool>) -> SharedArray<bool> {
@@ -1152,7 +1909,7 @@ impl NdArrayBoolOps {
         };
 
         // Use the helper to broadcast both arrays to a common shape
-        let (lhs_broadcast, rhs_broadcast) = broadcast_for_comparison(&lhs, &rhs);
+        let (lhs_broadcast, rhs_broadcast) = broadcast_for_binary_ops(&lhs, &rhs);
         // Now we can safely zip and compare
         Zip::from(&lhs_broadcast)
             .and(&rhs_broadcast)
@@ -1168,12 +1925,22 @@ impl NdArrayBoolOps {
         };
 
         // Use the helper to broadcast both arrays to a common shape
-        let (lhs_broadcast, rhs_broadcast) = broadcast_for_comparison(&lhs, &rhs);
+        let (lhs_broadcast, rhs_broadcast) = broadcast_for_binary_ops(&lhs, &rhs);
         // Now we can safely zip and compare
         Zip::from(&lhs_broadcast)
             .and(&rhs_broadcast)
             .map_collect(|&lhs, &rhs| lhs || rhs)
             .into_shared()
+    }
+
+    /// Any element is true - zero-copy for borrowed storage.
+    pub fn any_view(view: ArrayView<'_, bool, IxDyn>) -> bool {
+        view.iter().any(|&x| x)
+    }
+
+    /// All elements are true - zero-copy for borrowed storage.
+    pub fn all_view(view: ArrayView<'_, bool, IxDyn>) -> bool {
+        view.iter().all(|&x| x)
     }
 }
 
@@ -1182,21 +1949,51 @@ enum CmpType {
     Max,
 }
 
-fn arg<E: NdArrayElement, I: NdArrayElement>(
+fn arg<E: NdArrayElement + PartialOrd, I: NdArrayElement + PartialOrd>(
     tensor: SharedArray<E>,
     dim: usize,
     cmp: CmpType,
 ) -> SharedArray<I> {
-    let mut reshape = tensor.shape().to_vec();
+    arg_view(tensor.view(), dim, cmp)
+}
+
+/// View-based argmax/argmin - zero-copy for borrowed storage.
+///
+/// NaN propagation: if the current element is NaN, it is always selected (NaN
+/// propagates, matching PyTorch / NumPy / JAX / TensorFlow semantics).
+fn arg_view<E: NdArrayElement + PartialOrd, I: NdArrayElement + PartialOrd>(
+    view: ArrayView<'_, E, IxDyn>,
+    dim: usize,
+    cmp: CmpType,
+) -> SharedArray<I> {
+    // Checked before `map_axis`, which skips its closure entirely when another axis is also
+    // zero-length and would otherwise let `[0, 0]` through while `[3, 0]` panics on `arr[0]`.
+    assert!(
+        view.shape()[dim] > 0,
+        "Cannot compute arg over an empty axis"
+    );
+
+    let mut reshape = view.shape().to_vec();
     reshape[dim] = 1;
 
-    let output = tensor.map_axis(Axis(dim), |arr| {
+    let output = view.map_axis(Axis(dim), |arr| {
         // Find the min/max value in the array, and return its index.
+        // NaN propagation: NaN is always selected over non-NaN values,
+        // and the first NaN encountered wins (stable).
         let (_e, idx) = arr.indexed_iter().fold((arr[0], 0usize), |acc, (idx, e)| {
-            let cmp = match cmp {
-                CmpType::Min => e < &acc.0,
-                CmpType::Max => e > &acc.0,
-            };
+            // Use partial_cmp to detect NaN: partial_cmp returns None iff either
+            // operand is NaN (for IEEE 754 float types).
+            let is_acc_nan = acc.0.partial_cmp(&acc.0).is_none();
+            let is_e_nan = e.partial_cmp(e).is_none();
+
+            // Select e when:
+            // - acc is not NaN AND (e is NaN OR normal comparison holds)
+            let cmp = !is_acc_nan
+                && (is_e_nan
+                    || match cmp {
+                        CmpType::Min => e < &acc.0,
+                        CmpType::Max => e > &acc.0,
+                    });
 
             if cmp { (*e, idx) } else { acc }
         });
@@ -1211,17 +2008,41 @@ fn arg<E: NdArrayElement, I: NdArrayElement>(
 
 #[cfg(test)]
 mod tests {
-    use burn_tensor::TensorData;
+    use burn_backend::TensorData;
 
     use crate::NdArrayTensor;
 
     use super::*;
 
     #[test]
+    fn remainder_preserves_i64_precision_and_handles_overflow() {
+        for (a, b, expected) in [
+            ((1i64 << 53) + 1, 2, 1),
+            (i64::MAX - 1, i64::MAX, i64::MAX - 1),
+            (i64::MIN, -1, 0),
+            (1, i64::MIN, i64::MIN + 1),
+            (-5, 3, 1),
+        ] {
+            let lhs = ndarray::array![a].into_dyn().into_shared();
+            let rhs = ndarray::array![b].into_dyn().into_shared();
+            assert_eq!(NdArrayMathOps::remainder(lhs.clone(), rhs)[[0]], expected);
+            assert_eq!(NdArrayMathOps::remainder_scalar(lhs, b)[[0]], expected);
+        }
+    }
+
+    #[test]
+    fn remainder_preserves_u64_precision() {
+        let lhs = ndarray::array![u64::MAX].into_dyn().into_shared();
+        let rhs = ndarray::array![2u64].into_dyn().into_shared();
+        assert_eq!(NdArrayMathOps::remainder(lhs.clone(), rhs)[[0]], 1);
+        assert_eq!(NdArrayMathOps::remainder_scalar(lhs, 2)[[0]], 1);
+    }
+
+    #[test]
     fn should_generate_row_major_layout_for_cat() {
         let expected_shape: &[usize] = &[4, 6, 2];
         let expected_strides: &[isize] = &[12, 2, 1];
-        let NdArrayTensor::I32(expected_array) = NdArrayTensor::from_data(TensorData::from([
+        let NdArrayTensor::I32(expected_storage) = NdArrayTensor::from_data(TensorData::from([
             [[1, 0], [2, 0], [3, 0], [4, 0], [5, 0], [6, 0]],
             [[7, 0], [8, 0], [9, 0], [10, 0], [11, 0], [12, 0]],
             [[13, 0], [14, 0], [15, 0], [16, 0], [17, 0], [18, 0]],
@@ -1229,8 +2050,9 @@ mod tests {
         ])) else {
             panic!()
         };
+        let expected_array = expected_storage.into_shared();
 
-        let NdArrayTensor::I32(tensor) = NdArrayTensor::from_data(TensorData::from([
+        let NdArrayTensor::I32(tensor_storage) = NdArrayTensor::from_data(TensorData::from([
             [1, 2, 3, 4, 5, 6],
             [7, 8, 9, 10, 11, 12],
             [13, 14, 15, 16, 17, 18],
@@ -1238,14 +2060,16 @@ mod tests {
         ])) else {
             panic!()
         };
+        let tensor = tensor_storage.into_shared();
 
         // unsqueeze dim on the outermost axis
         let array = NdArrayOps::reshape(tensor, Shape::from([4, 6, 1]));
-        let NdArrayTensor::I32(zeros) =
+        let NdArrayTensor::I32(zeros_storage) =
             NdArrayTensor::from_data(TensorData::zeros::<i32, _>([4, 6, 1]))
         else {
             panic!()
         };
+        let zeros = zeros_storage.into_shared();
         // make `ndarray` concatenates array on the outermost axis
         let array = NdArrayOps::cat([array, zeros].to_vec(), 2);
 

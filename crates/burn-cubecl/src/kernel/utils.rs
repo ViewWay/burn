@@ -1,81 +1,135 @@
+use burn_backend::Shape;
 use cubecl::prelude::SequenceArg;
 use cubecl::{
-    prelude::ArrayArg,
-    std::{
-        FastDivmod, FastDivmodArgs,
-        tensor::layout::linear::{LinearLayoutArgs, LinearViewLaunch},
-    },
+    prelude::*,
+    std::{FastDivmod, FastDivmodInt},
 };
 
-use crate::{CubeRuntime, tensor::CubeTensor};
+use crate::tensor::CubeTensor;
 
-pub fn shape_divmod<'a, R: CubeRuntime>(tensor: &CubeTensor<R>) -> SequenceArg<'a, R, FastDivmod> {
+pub fn shape_divmod(tensor: &CubeTensor) -> SequenceArg<FastDivmod<usize>> {
     let mut arg = SequenceArg::new();
-    for dim in tensor.shape.dims.iter() {
-        arg.push(FastDivmodArgs::new(&tensor.client, *dim as u32));
+    for dim in tensor.meta.shape().iter() {
+        arg.push(*dim);
     }
     arg
 }
 
-pub fn linear_layout<'a, R: CubeRuntime>(
-    tensor: &'a CubeTensor<R>,
-    line_size: &'a u8,
-) -> LinearLayoutArgs<'a, R> {
-    LinearLayoutArgs::from_shape_strides(
-        &tensor.client,
-        &tensor.shape.dims,
-        &tensor.strides,
-        line_size,
-    )
+pub fn shape_divmod_range(
+    tensor: &CubeTensor,
+    range: core::ops::Range<usize>,
+) -> SequenceArg<FastDivmod<usize>> {
+    let mut arg = SequenceArg::new();
+    let shape = &tensor.meta.shape;
+    for i in range {
+        arg.push(shape[i]);
+    }
+    arg
 }
 
-pub fn linear_view<'a, R: CubeRuntime>(
-    tensor: &'a CubeTensor<R>,
-    line_size: &'a u8,
-) -> LinearViewLaunch<'a, R> {
-    let len = tensor.shape.dims.iter().product::<usize>();
-    let layout = linear_layout(tensor, line_size);
-    let buffer = unsafe {
-        ArrayArg::from_raw_parts_and_size(&tensor.handle, len, *line_size, tensor.elem_size())
-    };
-    LinearViewLaunch::new(buffer, layout)
-}
-
-pub fn linear_view_alias<'a, R: CubeRuntime>(
-    tensor: &'a CubeTensor<R>,
-    line_size: &'a u8,
-    pos: usize,
-) -> LinearViewLaunch<'a, R> {
-    let layout = linear_layout(tensor, line_size);
-    let buffer = ArrayArg::Alias { input_pos: pos };
-    LinearViewLaunch::new(buffer, layout)
-}
-
-pub fn split_dim<R: CubeRuntime>(
-    mut tensor: CubeTensor<R>,
-    dim: usize,
-    shape: &[usize],
-) -> CubeTensor<R> {
-    let mut stride = tensor.strides[dim];
-    tensor.shape.dims.remove(dim);
-    tensor.strides.remove(dim);
+pub fn split_dim(mut tensor: CubeTensor, dim: usize, shape: &[usize]) -> CubeTensor {
+    let mut stride = tensor.meta.strides()[dim];
+    tensor.meta.remove(dim);
 
     for size in shape.iter().rev() {
-        tensor.shape.dims.insert(dim, *size);
-        tensor.strides.insert(dim, stride);
+        tensor.meta.insert(dim, *size, stride);
         stride *= size;
     }
 
     tensor
 }
 
-pub fn merge_dims<R: CubeRuntime>(
-    mut tensor: CubeTensor<R>,
-    dim0: usize,
-    dim1: usize,
-) -> CubeTensor<R> {
-    tensor.shape.dims[dim1] *= tensor.shape.dims[dim0];
-    tensor.shape.dims.remove(dim0);
-    tensor.strides.remove(dim0);
-    tensor
+pub fn broadcast_shape(tensors: &[&CubeTensor]) -> Shape {
+    let rank = tensors[0].meta.num_dims();
+    debug_assert!(
+        tensors.iter().all(|it| it.meta.num_dims() == rank),
+        "Broadcast tensors must have the same rank"
+    );
+
+    let dims = (0..rank).map(|dim| {
+        // Broadcasting stretches a size-1 dim to the other operand's size, which may be 0.
+        // Every size that is not 1 must agree, and that shared size (0 included) is the result.
+        // Taking the max would be wrong when a 0 meets a 1: max picks 1 and drops the 0.
+        let mut broadcast = 1;
+        for tensor in tensors {
+            let size = tensor.meta.shape()[dim];
+            if size != 1 {
+                debug_assert!(
+                    broadcast == 1 || broadcast == size,
+                    "Broadcast dims must match or be 1"
+                );
+                broadcast = size;
+            }
+        }
+        broadcast
+    });
+
+    Shape::from(dims)
 }
+
+pub fn broadcast_strides(reference: &CubeTensor, tensor: &CubeTensor) -> SequenceArg<usize> {
+    if reference.meta.shape() != tensor.meta.shape() {
+        tensor
+            .meta
+            .strides()
+            .iter()
+            .zip(
+                tensor
+                    .meta
+                    .shape()
+                    .iter()
+                    .zip(reference.meta.shape().iter()),
+            )
+            .map(|(stride, (shape, ref_shape))| if *shape == *ref_shape { *stride } else { 0 })
+            .collect()
+    } else {
+        tensor.meta.strides().iter().copied().collect()
+    }
+}
+
+#[cube]
+pub(crate) fn decompose_linear<I: FastDivmodInt>(
+    pos: I,
+    shape: &Sequence<FastDivmod<I>>,
+) -> (I, Sequence<I>) {
+    let rank = comptime![shape.len()];
+    let mut offs = pos;
+    let mut out = Sequence::new();
+
+    #[unroll]
+    for i in 0..rank {
+        let dim = comptime![rank - i - 1];
+        let (rem, offs_local) = shape.index(dim).div_mod(offs);
+        out.push(offs_local);
+        offs = rem;
+    }
+
+    (offs, out.reversed())
+}
+
+pub(crate) trait RequiredAddrType {
+    fn required_address_type(&self) -> AddressType;
+}
+
+impl RequiredAddrType for CubeTensor {
+    fn required_address_type(&self) -> AddressType {
+        self.required_address_type()
+    }
+}
+impl RequiredAddrType for Option<CubeTensor> {
+    fn required_address_type(&self) -> AddressType {
+        self.as_ref()
+            .map(|it| it.required_address_type())
+            .unwrap_or_default()
+    }
+}
+
+macro_rules! address_type {
+    ($($tensor: tt),*) => {
+        [$($crate::kernel::utils::RequiredAddrType::required_address_type(&$tensor)),*]
+        .into_iter()
+        .max()
+        .unwrap_or_default()
+    };
+}
+pub(crate) use address_type;

@@ -16,17 +16,21 @@ workspace = true
 
 [features]
 default = ["std"]
-std = ["burn-tensor/std"]
+std = ["burn-backend/std", "burn-std/std"]
 doc = ["default"]
+tracing = [
+    "burn-backend/tracing",
+]
 
 [dependencies]
 serde = { workspace = true }
 hashbrown = { workspace = true } # no_std compatible
 
-burn-tensor = { path = "../burn-tensor", version = "0.19.0", default-features = false }
-
-[target.'cfg(not(target_has_atomic = "ptr"))'.dependencies]
-portable-atomic-util = { workspace = true }
+burn-backend = { workspace = true }
+# `Arc`, on targets without pointer-width atomics too (`burn_std::sync::Arc`):
+# `alloc::sync` does not exist on thumbv6m, and an errored handle's cause is
+# shared behind one.
+burn-std = { workspace = true }
 
 [package.metadata.docs.rs]
 features = ["doc"]

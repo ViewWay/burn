@@ -1,4 +1,4 @@
-#![recursion_limit = "141"]
+use burn::{server::Channel, tensor::Device};
 
 pub fn start() {
     let port = std::env::var("REMOTE_BACKEND_PORT")
@@ -8,17 +8,5 @@ pub fn start() {
         })
         .unwrap_or(3000);
 
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "ndarray")]{
-            burn::server::start_websocket::<burn::backend::NdArray>(Default::default(), port);
-        } else if #[cfg(feature = "cuda")]{
-            burn::server::start_websocket::<burn::backend::Cuda>(Default::default(), port);
-        } else if #[cfg(feature = "webgpu")] {
-            burn::server::start_websocket::<burn::backend::WebGpu>(Default::default(), port);
-        } else if #[cfg(feature = "vulkan")] {
-            burn::server::start_websocket::<burn::backend::Vulkan>(Default::default(), port);
-        } else {
-            panic!("No backend selected, can't start server on port {port}");
-        }
-    }
+    burn::server::start(Device::default(), Channel::WebSocket { port });
 }

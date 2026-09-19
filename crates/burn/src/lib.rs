@@ -41,28 +41,46 @@
 //! autodifferentiation and automatic kernel fusion.
 //!
 //! - WGPU (WebGPU): Cross-Platform GPU Backend
-//! - Candle: Backend using the Candle bindings
-//! - LibTorch: Backend using the LibTorch bindings
-//! - NdArray: Backend using the NdArray primitive as data structure
+//! - LibTorch: Backend using the LibTorch bindings (deprecated)
+//! - Flex: Pure-Rust CPU backend (std, no_std, WebAssembly)
 //! - Autodiff: Backend decorator that brings backpropagation to any backend
 //! - Fusion: Backend decorator that brings kernel fusion to backends that support it
 //!
-//! # Quantization (Beta)
+//! # Quantization
 //!
-//! Quantization techniques perform computations and store tensors in lower precision data types like 8-bit integer
-//! instead of floating point precision. There are multiple approaches to quantize a deep learning model. In most cases,
-//! the model is trained in floating point precision and later converted to the lower precision data type. This is called
-//! post-training quantization (PTQ). On the other hand, quantization aware training (QAT) models the effects of quantization
-//! during training. Quantization errors are thus modeled in the forward and backward passes, which helps the model learn
-//! representations that are more robust to the reduction in precision.
+//! Quantization techniques perform computations and store tensors in lower precision data types like
+//! 8-bit integer instead of floating point precision. There are multiple approaches to quantize a deep
+//! learning model categorized as post-training quantization (PTQ) and quantization aware training (QAT).
 //!
-//! Quantization support in Burn is currently in active development. It supports the following modes on some backends:
-//! - Static per-tensor quantization to signed 8-bit integer (`i8`)
+//! In post-training quantization, the model is trained in floating point precision and later converted
+//! to the lower precision data type. There are two types of post-training quantization:
+//!
+//! 1. Static quantization: quantizes the weights and activations of the model. Quantizing the
+//!    activations statically requires data to be calibrated (i.e., recording the activation values to
+//!    compute the optimal quantization parameters with representative data).
+//! 2. Dynamic quantization: quantized the weights ahead of time (like static quantization) but the
+//!    activations are dynamically at runtime.
+//!
+//! Sometimes post-training quantization is not able to achieve acceptable task accuracy. In general,
+//! this is where quantization-aware training (QAT) can be used: during training, fake-quantization
+//! modules are inserted in the forward and backward passes to simulate quantization effects, allowing
+//! the model to learn representations that are more robust to reduced precision.
+//!
+//! Burn does not currently support QAT. Only post-training quantization (PTQ) is implemented at this
+//! time.
+//!
+//! Quantization support in Burn is currently in active development. It supports the following PTQ modes on some backends:
+//! - Per-tensor and per-block quantization to 8-bit, 4-bit and 2-bit representations
 //!
 //! ## Feature Flags
 //!
 //! The following feature flags are available.
-//! By default, the feature `std` is activated.
+//! Default features include `std` but no execution backend.
+//! Select a backend explicitly, for example `features = ["wgpu"]` or `["flex"]`.
+//! Specialized operations are also opt-in, for example `features = ["flex", "signal"]`.
+//! Backend-free builds can define tensor/model APIs without installing an execution backend.
+//! `Device::default()` panics if no execution backend is available; graph capture remains
+//! available through `Device::capture()` with the `capture` feature.
 //!
 //! - Training
 //!   - `train`: Enables features `dataset` and `autodiff` and provides a training environment
@@ -71,36 +89,86 @@
 //! - Dataset
 //!   - `dataset`: Includes a datasets library
 //!   - `audio`: Enables audio datasets (SpeechCommandsDataset)
-//!   - `sqlite`: Stores datasets in SQLite database
-//!   - `sqlite_bundled`: Use bundled version of SQLite
+//!   - `sqlite`: Stores datasets in an SQLite database, backed by [Turso](https://turso.tech/)
+//!   - `sqlite-bundled`: Deprecated alias for `sqlite`
 //!   - `vision`: Enables vision datasets (MnistDataset)
 //! - Backends
 //!   - `wgpu`: Makes available the WGPU backend
 //!   - `webgpu`: Makes available the `wgpu` backend with the WebGPU Shading Language (WGSL) compiler
 //!   - `vulkan`: Makes available the `wgpu` backend with the alternative SPIR-V compiler
 //!   - `cuda`: Makes available the CUDA backend
+//!   - `metal`: Makes available the Metal backend
 //!   - `rocm`: Makes available the ROCm backend
-//!   - `candle`: Makes available the Candle backend
-//!   - `tch`: Makes available the LibTorch backend
-//!   - `ndarray`: Makes available the NdArray backend
+//!   - `cpu`: Makes available the CubeCL CPU backend
+//!   - `tch`: Makes available the LibTorch backend (deprecated - use a CubeCL backend instead)
+//!   - `flex`: Makes available the Flex backend (pure-Rust CPU, std/no_std/WASM)
+//!   - `ndarray`: Makes available the NdArray backend (deprecated - use `flex` instead)
 //! - Backend specifications
+//!   - `simd`: Enable SIMD codegen in the CPU backends
+//!   - `rayon`: Enable multi-threaded execution in the CPU backends
 //!   - `accelerate`: If supported, Accelerate will be used
 //!   - `blas-netlib`: If supported, Blas Netlib will be use
 //!   - `openblas`: If supported, Openblas will be use
 //!   - `openblas-system`: If supported, Openblas installed on the system will be use
 //!   - `autotune`: Enable running benchmarks to select the best kernel in backends that support it.
 //!   - `fusion`: Enable operation fusion in backends that support it.
+//!   - `tracing`: Enable diagnostic tracing in the selected backends (disabled by default).
 //! - Backend decorators
 //!   - `autodiff`: Makes available the Autodiff backend
+//! - Model Storage
+//!   - `store`: Enables model storage with SafeTensors format and PyTorch interoperability
 //! - Others:
 //!   - `std`: Activates the standard library (deactivate for no_std)
+//!   - `linalg`: Enables linear algebra operations
+//!   - `capture`: Makes the non-executing graph capture backend available.
+//!   - `ir`: Makes Burn's operation intermediate representation available.
+//!   - `signal`: Enables signal processing operations from `burn-signal`.
 //!   - `server`: Enables the remote server.
 //!   - `network`: Enables network utilities (currently, only a file downloader with progress bar)
-//!   - `experimental-named-tensor`: Enables named tensors (experimental)
 //!
 //! You can also check the details in sub-crates [`burn-core`](https://docs.rs/burn-core) and [`burn-train`](https://docs.rs/burn-train).
+//!
+//! ### Backend tracing
+//!
+//! Add `"tracing"` to the features of your `burn` dependency to compile backend instrumentation,
+//! including autodiff and fusion spans. When depending directly on `burn-autodiff` or
+//! `burn-fusion`, enable their `tracing` feature instead. These spans are opt-in: configuring a
+//! tracing subscriber alone does not enable them. Configure your subscriber to include the
+//! `trace` level to observe tensor operation spans.
+//!
+//! The feature propagates to enabled backends without selecting an additional backend. Normal
+//! training logs remain available without this feature.
 
 pub use burn_core::*;
+
+/// Linear algebra operations.
+#[cfg(feature = "linalg")]
+pub mod linalg {
+    pub use burn_linalg::*;
+}
+
+/// Core module infrastructure and neural-network initializers.
+pub mod module {
+    pub use burn_core::module::*;
+    pub use burn_nn::Initializer;
+}
+
+/// Tensor types and compatibility re-exports.
+pub mod tensor {
+    pub use burn_core::tensor::*;
+
+    /// Compatibility path for signal processing operations.
+    #[cfg(feature = "signal")]
+    pub mod signal {
+        pub use burn_signal::*;
+    }
+
+    /// Compatibility path for linear algebra operations.
+    #[cfg(feature = "linalg")]
+    pub mod linalg {
+        pub use burn_linalg::*;
+    }
+}
 
 /// Train module
 #[cfg(feature = "train")]
@@ -108,12 +176,110 @@ pub mod train {
     pub use burn_train::*;
 }
 
-/// Backend module.
-pub mod backend;
+/// Module for reinforcement learning.
+#[cfg(feature = "rl")]
+pub mod rl {
+    pub use burn_rl::*;
+}
 
-#[cfg(feature = "server")]
-pub use burn_remote::server;
+#[cfg(feature = "remote-server")]
+pub use burn_core::tensor::server;
 
-/// Module for collective operations
-#[cfg(feature = "collective")]
-pub mod collective;
+/// Model storage and serialization: the non-generic record system (always available), plus —
+/// with the `store` feature — the snapshot tooling and importers (SafeTensors, PyTorch, burnpack).
+pub mod store {
+    pub use burn_core::store::*;
+    #[cfg(feature = "store")]
+    pub use burn_store::*;
+}
+
+/// Neural network module.
+pub mod nn {
+    pub use burn_nn::*;
+}
+
+pub use burn_std::config::{BurnConfig, config as runtime_config};
+
+#[cfg(all(test, feature = "capture"))]
+mod capture_tests {
+    use crate::{module::Module, nn::BatchNormConfig, tensor::Device};
+
+    #[test]
+    fn capture_feature_exposes_the_user_facing_device_api() {
+        let device = Device::capture();
+        let captured = device
+            .capture_scope(|scope| scope.complete([], []))
+            .unwrap();
+
+        assert!(captured.graph.operations.is_empty());
+    }
+
+    #[test]
+    fn shared_running_state_moves_across_capture_scopes() {
+        let module = BatchNormConfig::new(3).init(&Device::default());
+        let first_device = Device::capture();
+        let second_device = Device::capture();
+
+        let first = first_device
+            .capture_scope(|scope| {
+                let _module = module.clone().to_device(&first_device);
+                scope.complete([], [])
+            })
+            .unwrap();
+        let second = second_device
+            .capture_scope(|scope| {
+                let _module = module.clone().to_device(&second_device);
+                scope.complete([], [])
+            })
+            .unwrap();
+
+        assert_eq!(first.values.len(), 4);
+        assert_eq!(second.values.len(), 4);
+    }
+}
+
+/// Optimizers module.
+#[cfg(feature = "optim")]
+pub mod optim {
+    pub use burn_optim::*;
+}
+
+// For backward compat, `burn::lr_scheduler::*`
+/// Learning rate scheduler module.
+#[cfg(all(feature = "optim", feature = "std"))]
+pub mod lr_scheduler {
+    pub use burn_optim::lr_scheduler::*;
+}
+// For backward compat, `burn::grad_clipping::*`
+/// Gradient clipping module.
+#[cfg(feature = "optim")]
+pub mod grad_clipping {
+    pub use burn_optim::grad_clipping::*;
+}
+
+/// CubeCL module re-export.
+#[cfg(feature = "cubecl")]
+pub mod cubecl {
+    pub use cubecl::*;
+}
+
+#[cfg(feature = "vision")]
+/// Vision module.
+pub mod vision {
+    pub use burn_vision::*;
+}
+
+#[cfg(feature = "signal")]
+/// Signal processing module.
+pub mod signal {
+    pub use burn_signal::*;
+}
+
+pub mod prelude {
+    //! Structs and macros used by most projects. Add `use
+    //! burn::prelude::*` to your code to quickly get started with
+    //! Burn.
+    pub use burn_core::prelude::*;
+
+    pub use crate::nn;
+}

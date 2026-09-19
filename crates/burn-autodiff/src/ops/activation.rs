@@ -7,14 +7,11 @@ use crate::{
         strategy::CheckpointStrategy,
     },
     grads::Gradients,
-    graph::NodeID,
+    graph::NodeId,
     ops::{Backward, Ops, OpsKind, unary},
     retro_unary,
 };
-use burn_tensor::{
-    backend::Backend,
-    ops::{ActivationOps, FloatTensor},
-};
+use burn_backend::{Backend, ops::ActivationOps, tensor::FloatTensor};
 
 impl<B: Backend, C: CheckpointStrategy> ActivationOps<Autodiff<B, C>> for Autodiff<B, C> {
     fn gelu(tensor: FloatTensor<Self>) -> FloatTensor<Self> {
@@ -24,7 +21,7 @@ impl<B: Backend, C: CheckpointStrategy> ActivationOps<Autodiff<B, C>> for Autodi
         retro_unary!(RetroGelu, B::gelu);
 
         impl<B: Backend> Backward<B, 1> for Gelu {
-            type State = NodeID;
+            type State = NodeId;
 
             fn backward(
                 self,
@@ -41,7 +38,7 @@ impl<B: Backend, C: CheckpointStrategy> ActivationOps<Autodiff<B, C>> for Autodi
         }
 
         match Gelu
-            .prepare::<C>([tensor.node.clone()])
+            .prepare::<C>([tensor.node()])
             .memory_bound()
             .retro_forward(RetroGelu::<B>::new(tensor.node.id))
             .parents([&tensor])
@@ -62,7 +59,7 @@ impl<B: Backend, C: CheckpointStrategy> ActivationOps<Autodiff<B, C>> for Autodi
         retro_unary!(RetroRelu, B::relu);
 
         impl<B: Backend> Backward<B, 1> for Relu {
-            type State = NodeID;
+            type State = NodeId;
 
             fn backward(
                 self,
@@ -78,7 +75,7 @@ impl<B: Backend, C: CheckpointStrategy> ActivationOps<Autodiff<B, C>> for Autodi
         }
 
         match Relu
-            .prepare::<C>([tensor.node.clone()])
+            .prepare::<C>([tensor.node()])
             .memory_bound()
             .retro_forward(RetroRelu::<B>::new(tensor.node.id))
             .parents([&tensor])
@@ -99,7 +96,7 @@ impl<B: Backend, C: CheckpointStrategy> ActivationOps<Autodiff<B, C>> for Autodi
         retro_unary!(RetroSigmoid, B::sigmoid);
 
         impl<B: Backend> Backward<B, 1> for Sigmoid {
-            type State = NodeID;
+            type State = NodeId;
 
             fn backward(
                 self,
@@ -116,7 +113,7 @@ impl<B: Backend, C: CheckpointStrategy> ActivationOps<Autodiff<B, C>> for Autodi
         }
 
         match Sigmoid
-            .prepare::<C>([tensor.node.clone()])
+            .prepare::<C>([tensor.node()])
             .memory_bound()
             .retro_forward(RetroSigmoid::<B>::new(tensor.node.id))
             .parents([&tensor])
@@ -137,7 +134,7 @@ impl<B: Backend, C: CheckpointStrategy> ActivationOps<Autodiff<B, C>> for Autodi
         retro_unary!(RetroLogSigmoid, B::log_sigmoid);
 
         impl<B: Backend> Backward<B, 1> for LogSigmoid {
-            type State = NodeID;
+            type State = NodeId;
 
             fn backward(
                 self,
@@ -154,7 +151,7 @@ impl<B: Backend, C: CheckpointStrategy> ActivationOps<Autodiff<B, C>> for Autodi
         }
 
         match LogSigmoid
-            .prepare::<C>([tensor.node.clone()])
+            .prepare::<C>([tensor.node()])
             .memory_bound()
             .retro_forward(RetroLogSigmoid::<B>::new(tensor.node.id))
             .parents([&tensor])

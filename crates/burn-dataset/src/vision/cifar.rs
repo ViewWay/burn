@@ -38,10 +38,10 @@
 
 use std::{path::PathBuf, sync::Mutex};
 
-use burn_common::network::downloader;
 use flate2::read::GzDecoder;
 use tar::Archive;
 
+use crate::network::downloader;
 use crate::vision::ImageFolderDataset;
 
 /// CIFAR-10 mirror from [fastai](https://github.com/fastai/fastai/blob/master/fastai/data/external.py#L44).
@@ -118,9 +118,8 @@ fn download(cifar_type: &CifarType) -> PathBuf {
     let _lock = DOWNLOAD_LOCK.lock().unwrap();
 
     // Dataset files are stored in the burn-dataset cache directory
-    let cache_dir = dirs::home_dir()
-        .expect("Could not get home directory")
-        .join(".cache")
+    let cache_dir = dirs::cache_dir()
+        .expect("Could not get cache directory")
         .join("burn-dataset");
 
     // Cifar store directory
@@ -221,7 +220,10 @@ mod tests {
     }
 
     fn get_label_range(dataset: &ImageFolderDataset) -> (usize, usize) {
-        let labels: Vec<_> = dataset.iter().map(|item| item.annotation).collect();
+        let labels: Vec<_> = dataset
+            .iter()
+            .map(|item| item.unwrap().annotation)
+            .collect();
         let mut min = 128;
         let mut max = 0;
         for label in labels {

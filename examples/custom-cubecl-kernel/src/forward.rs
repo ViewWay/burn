@@ -1,24 +1,21 @@
 use crate::{FloatTensor, kernel::fused_matmul_add_relu_kernel};
 
 use super::Backend;
-use burn::tensor::Shape;
-use burn_cubecl::{
-    CubeBackend, CubeRuntime, FloatElement, IntElement, element::BoolElement,
-    kernel::into_contiguous, tensor::CubeTensor,
-};
+use burn::backend::cubecl::dtype_to_storage_type;
+use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
 use cubecl::{CubeCount, CubeDim};
 
-/// Implement our custom backend trait for the generic `CubeBackend`.
-impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> Backend
-    for CubeBackend<R, F, I, BT>
-{
+/// Implement our custom backend trait for the cubecl backend. One impl covers every runtime:
+/// a tensor's device says which one it runs on.
+impl Backend for CubeBackend {
     fn fused_matmul_add_relu(
         lhs: FloatTensor<Self>,
         rhs: FloatTensor<Self>,
         bias: FloatTensor<Self>,
     ) -> FloatTensor<Self> {
+        let dtype = lhs.dtype;
         // Define cube dim, hardcoded for simplicity.
-        let cube_dim = CubeDim { x: 16, y: 16, z: 1 };
+        let cube_dim = CubeDim::new_3d(16, 16, 1);
 
         lhs.assert_is_on_same_device(&rhs);
         lhs.assert_is_on_same_device(&bias);
@@ -28,26 +25,18 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> Backend
         let rhs = into_contiguous(rhs);
         let bias = into_contiguous(bias);
 
-        // Get the matmul relevant shapes.
-        let ndims = lhs.shape.num_dims();
-        let num_rows = lhs.shape.dims[ndims - 2];
-        let num_cols = rhs.shape.dims[ndims - 1];
+        assert_eq!(lhs.dtype, rhs.dtype, "matrix dtypes must match");
+        assert_eq!(lhs.dtype, bias.dtype, "bias dtype must match");
+        let shape_out = crate::output_shape(lhs.meta.shape(), rhs.meta.shape(), bias.meta.shape());
 
-        // Compute shape of output, while tracking number of batches.
-        let mut num_batches = 1;
-        let mut shape_out = vec![0; ndims];
-        for i in shape_out.clone().into_iter().take(ndims - 2) {
-            shape_out[i] = usize::max(lhs.shape.dims[i], rhs.shape.dims[i]);
-            num_batches *= shape_out[i];
-        }
-        shape_out[ndims - 2] = num_rows;
-        shape_out[ndims - 1] = num_cols;
-        let shape_out = Shape::from(shape_out);
+        // Get the matmul relevant shapes after validating the inputs.
+        let ndims = lhs.meta.num_dims();
+        let num_rows = lhs.meta.shape()[ndims - 2];
+        let num_cols = rhs.meta.shape()[ndims - 1];
+        let num_batches: usize = (0..ndims - 2).map(|i| shape_out[i]).product();
 
         // Create a buffer for the output tensor.
-        let buffer = lhs
-            .client
-            .empty(shape_out.num_elements() * core::mem::size_of::<F>());
+        let buffer = lhs.client.empty(shape_out.num_elements() * dtype.size());
 
         // Create the output tensor primitive.
         let output = CubeTensor::new_contiguous(
@@ -55,7 +44,7 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> Backend
             lhs.device.clone(),
             shape_out,
             buffer,
-            F::dtype(),
+            dtype,
         );
 
         // Declare the wgsl workgroup with the number of cubes in x, y and z.
@@ -66,14 +55,15 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> Backend
 
         // Execute lazily the kernel with the launch information and the given buffers. For
         // simplicity, no vectorization is performed
-        fused_matmul_add_relu_kernel::launch::<F, R>(
-            &lhs.client,
+        fused_matmul_add_relu_kernel::launch(
+            &output.client,
             cube_count,
             cube_dim,
-            lhs.as_tensor_arg::<F>(1),
-            rhs.as_tensor_arg::<F>(1),
-            bias.as_tensor_arg::<F>(1),
-            output.as_tensor_arg::<F>(1),
+            lhs.into_tensor_arg(),
+            rhs.into_tensor_arg(),
+            bias.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            dtype_to_storage_type(dtype),
         );
 
         // Return the output tensor.

@@ -32,28 +32,65 @@ pub(crate) fn handle_command(
                     build_args.extend(vec!["--target", *build_target]);
                 }
 
+                // Resolve independently: burn-no-std-tests selects Flex for execution,
+                // which would otherwise hide regressions in backend-free library builds.
+                build_helpers::custom_crates_build(
+                    vec!["burn"],
+                    build_args.clone(),
+                    None,
+                    None,
+                    &format!("backend-free no-std with target {}", *build_target),
+                )?;
+
                 let mut crates = NO_STD_CRATES.to_vec();
 
                 if *build_target == ARM_NO_ATOMIC_PTR_TARGET {
-                    // Temporarily remove `burn-autodiff` from building with the
-                    // target `thumbv6m-none-eabi` as it requires enabling the
-                    // `arbitrary_self_types` feature for the
-                    // `clone_if_require_grad` method of
-                    // `burn-autodiff::graph::Node`
-                    crates.retain(|&v| v != "burn-autodiff");
-
+                    // Only build a subset of crates which require `portable_atomic_unsafe_assume_single_core`.
+                    // Dispatch and the explicit Flex integration tests enable `critical-section`
+                    // on targets without pointer atomics,
+                    // which is mutually exclusive with `portable_atomic_unsafe_assume_single_core` cfg.
+                    crates = vec!["burn-std", "burn-backend", "burn-ndarray"];
                     env_vars.insert(
                         "RUSTFLAGS",
                         "--cfg portable_atomic_unsafe_assume_single_core",
                     );
                 }
-                helpers::custom_crates_build(
+                build_helpers::custom_crates_build(
                     crates,
-                    build_args,
-                    Some(env_vars),
+                    build_args.clone(),
+                    Some(env_vars.clone()),
                     None,
                     &format!("no-std with target {}", *build_target),
-                )
+                )?;
+
+                // Second pass for `thumbv6m-none-eabi`: crates with `critical-section` feature
+                // enabled so `once_cell` (transitively pulled from `burn-flex` -> `gemm`) uses
+                // portable-atomic for CAS emulation.
+                if *build_target == ARM_NO_ATOMIC_PTR_TARGET {
+                    crates = NO_STD_CRATES.to_vec();
+                    // Exclude crates already covered by the unsafe-assume-single-core pass, plus
+                    // crates that don't support Thumbv6-M:
+                    // - `burn-autodiff` requires `arbitrary_self_types` for
+                    //   `clone_if_require_grad`;
+                    // - `burn-capture` relies on `Arc`, which requires pointer-width atomics.
+                    crates.retain(|&v| {
+                        v != "burn-autodiff"
+                            && v != "burn-std"
+                            && v != "burn-ndarray"
+                            && v != "burn-backend"
+                            && v != "burn-capture"
+                    });
+
+                    build_helpers::custom_crates_build(
+                        crates,
+                        build_args,
+                        None,
+                        None,
+                        &format!("no-std with target {} (critical-section)", *build_target),
+                    )?;
+                }
+
+                anyhow::Ok(())
             })?;
             Ok(())
         }
@@ -73,7 +110,7 @@ pub(crate) fn handle_command(
             base_commands::build::handle_command(args.try_into().unwrap(), env, context)?;
             // Specific additional commands to test specific features
             // burn-dataset
-            helpers::custom_crates_build(
+            build_helpers::custom_crates_build(
                 vec!["burn-dataset"],
                 vec!["--all-features"],
                 None,
@@ -93,6 +130,8 @@ pub(crate) fn handle_command(
                         only: args.only.clone(),
                         ci: args.ci,
                         release: args.release,
+                        features: args.features.clone(),
+                        no_default_features: args.no_default_features,
                     },
                     env.clone(),
                     ctx.clone(),

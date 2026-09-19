@@ -1,57 +1,72 @@
 use crate::{
-    CubeElement, CubeRuntime,
-    kernel::utils::linear_view,
-    ops::{max_line_size, numeric::empty_device},
+    kernel::utils::address_type,
+    ops::{max_vector_size, numeric::empty_device_dtype},
     tensor::CubeTensor,
 };
-use cubecl::std::tensor::{layout::linear::LinearView, r#virtual::ReadWrite};
+use burn_backend::cubecl::dtype_to_storage_type;
+use burn_backend::{DType, TensorMetadata};
+use cubecl::std::tensor::layout::linear::{LinearView, LinearViewMut};
 use cubecl::{calculate_cube_count_elemwise, prelude::*};
-use std::any::TypeId;
 
-#[cube(launch)]
-pub(crate) fn cast_element<I: CubePrimitive, O: CubePrimitive>(
-    input: &LinearView<I>,
-    output: &mut LinearView<O, ReadWrite>,
+#[cube(launch, address_type = "dynamic")]
+pub(crate) fn cast_element<I: Numeric, O: Numeric, N: Size>(
+    input: LinearView<'_, Vector<I, N>>,
+    mut output: LinearViewMut<'_, Vector<O, N>>,
+    #[define(I, O)] _dtypes: [ElemType; 2],
 ) {
-    if ABSOLUTE_POS >= output.len() {
+    if !output.is_in_bounds(ABSOLUTE_POS) {
         terminate!();
     }
 
-    output[ABSOLUTE_POS] = Line::cast_from(input[ABSOLUTE_POS]);
+    output.write(ABSOLUTE_POS, Vector::cast_from(input.read(ABSOLUTE_POS)));
 }
 
 /// Cast a tensor to the given element type.
 ///
 /// Note: When input element is semantically a boolean, prefer bool_cast function.
-pub fn cast<R: CubeRuntime, EI: CubeElement, EO: CubeElement>(
-    input: CubeTensor<R>,
-) -> CubeTensor<R> {
-    if TypeId::of::<EI>() == TypeId::of::<EO>() {
-        return CubeTensor::new(
-            input.client,
-            input.handle,
-            input.shape,
-            input.device,
-            input.strides,
-            input.dtype,
-        );
+pub fn cast(input: CubeTensor, dtype: DType) -> CubeTensor {
+    let dtype_output = match dtype {
+        DType::Flex32 => DType::F32,
+        _ => dtype,
+    };
+    let dtype_input = match input.dtype {
+        DType::Flex32 => DType::F32,
+        _ => input.dtype,
+    };
+
+    if dtype_input == dtype_output {
+        return input;
     }
 
-    let line_size = max_line_size(&input);
-
-    let num_elems: usize = input.shape.num_elements();
-
-    let cube_dim = CubeDim::default();
-    let cube_count = calculate_cube_count_elemwise(num_elems / line_size as usize, cube_dim);
     let client = input.client.clone();
-    let output = empty_device::<R, EO>(client.clone(), input.device.clone(), input.shape.clone());
 
-    cast_element::launch::<EI, EO, R>(
+    let vector_size = max_vector_size(&input);
+
+    let num_elems: usize = input.meta.num_elements();
+
+    let working_units = num_elems / vector_size as usize;
+    let cube_dim = CubeDim::new(&client, working_units);
+    let cube_count = calculate_cube_count_elemwise(&client, working_units, cube_dim);
+
+    let output = empty_device_dtype(
+        client.clone(),
+        input.device.clone(),
+        input.shape(),
+        dtype, // We take the same dtype as passed as input (Flex32 not F32)
+    );
+
+    cast_element::launch(
         &client,
         cube_count,
         cube_dim,
-        linear_view(&input, &line_size),
-        linear_view(&output, &line_size),
+        address_type!(input, output),
+        vector_size,
+        input.into_linear_view(),
+        output.clone().into_linear_view(),
+        [
+            dtype_to_storage_type(dtype_input),
+            dtype_to_storage_type(dtype_output),
+        ],
     );
 
     output

@@ -1,5 +1,5 @@
-use super::{MetricMetadata, Numeric};
-use crate::metric::{Metric, MetricEntry, MetricName, NumericEntry};
+use super::MetricMetadata;
+use crate::metric::{Metric, MetricAttributes, MetricName, Numeric, NumericEntry, SerializedEntry};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -65,16 +65,19 @@ impl Default for CpuUse {
 impl Metric for CpuUse {
     type Input = ();
 
-    fn update(&mut self, _item: &Self::Input, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(&mut self, _item: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
         if self.last_refresh.elapsed() >= self.refresh_frequency {
             self.current = Self::refresh(&mut self.sys);
             self.last_refresh = Instant::now();
         }
+        self.compute()
+    }
 
+    fn compute(&mut self) -> SerializedEntry {
         let formatted = format!("{}: {:.2} %", self.name(), self.current);
         let raw = format!("{:.2}", self.current);
 
-        MetricEntry::new(self.name(), formatted, raw)
+        SerializedEntry::new(formatted, raw)
     }
 
     fn clear(&mut self) {}
@@ -82,10 +85,26 @@ impl Metric for CpuUse {
     fn name(&self) -> MetricName {
         self.name.clone()
     }
+
+    fn attributes(&self) -> MetricAttributes {
+        super::NumericAttributes {
+            unit: Some("%".to_string()),
+            higher_is_better: false,
+        }
+        .into()
+    }
 }
 
 impl Numeric for CpuUse {
-    fn value(&self) -> NumericEntry {
+    fn value(&self) -> Option<NumericEntry> {
+        Some(NumericEntry::Value(self.current))
+    }
+
+    fn running_value(&self) -> Option<NumericEntry> {
+        Some(NumericEntry::Value(self.current))
+    }
+
+    fn final_value(&self) -> NumericEntry {
         NumericEntry::Value(self.current)
     }
 }

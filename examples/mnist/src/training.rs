@@ -1,7 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     data::{MnistBatcher, MnistItemPrepared, MnistMapper, Transform},
+    file_progress::{FileEvaluationProgressLogger, FileTrainingProgressLogger},
     model::Model,
 };
 
@@ -18,25 +19,22 @@ use burn::{
         composed::ComposedLrSchedulerConfig, cosine::CosineAnnealingLrSchedulerConfig,
         linear::LinearLrSchedulerConfig,
     },
-    optim::{AdamConfig, decay::WeightDecayConfig},
     prelude::*,
-    record::{CompactRecorder, NoStdTrainingRecorder},
-    tensor::backend::AutodiffBackend,
     train::{
-        EvaluatorBuilder, LearnerBuilder, MetricEarlyStoppingStrategy, StoppingCondition,
+        EvaluatorBuilder, Learner, MetricEarlyStoppingStrategy, StoppingCondition,
         metric::{
             AccuracyMetric, LearningRateMetric, LossMetric,
             store::{Aggregate, Direction, Split},
         },
-        renderer::MetricsRenderer,
     },
 };
+use burn::{optim::AdamWConfig, train::SupervisedTraining};
 
 static ARTIFACT_DIR: &str = "/tmp/burn-example-mnist";
 
-#[derive(Config)]
+#[derive(Config, Debug)]
 pub struct MnistTrainingConfig {
-    #[config(default = 20)]
+    #[config(default = 5)]
     pub num_epochs: usize,
 
     #[config(default = 256)]
@@ -48,24 +46,27 @@ pub struct MnistTrainingConfig {
     #[config(default = 42)]
     pub seed: u64,
 
-    pub optimizer: AdamConfig,
+    pub optimizer: AdamWConfig,
 }
 
 fn create_artifact_dir(artifact_dir: &str) {
-    // Remove existing artifacts before to get an accurate learner summary
-    std::fs::remove_dir_all(artifact_dir).ok();
+    std::fs::remove_file(PathBuf::from(artifact_dir).join("experiment.log")).ok();
     std::fs::create_dir_all(artifact_dir).ok();
 }
 
-pub fn run<B: AutodiffBackend>(device: B::Device) {
+pub fn run(device: Device) {
     create_artifact_dir(ARTIFACT_DIR);
     // Config
-    let config_optimizer = AdamConfig::new().with_weight_decay(Some(WeightDecayConfig::new(5e-5)));
+    let config_optimizer = AdamWConfig::new()
+        .with_cautious_weight_decay(true)
+        .with_weight_decay(5e-5);
 
     let config = MnistTrainingConfig::new(config_optimizer);
-    B::seed(&device, config.seed);
 
-    let model = Model::<B>::new(&device);
+    device.seed(config.seed);
+    let autodiff_device = device.clone().autodiff();
+
+    let model = Model::new(&autodiff_device);
 
     let dataset_train_original = Arc::new(MnistDataset::train());
     let dataset_train_plain = PartialDataset::new(dataset_train_original.clone(), 0, 55_000);
@@ -92,47 +93,60 @@ pub fn run<B: AutodiffBackend>(device: B::Device) {
         .linear(LinearLrSchedulerConfig::new(1e-8, 1.0, 2000))
         .linear(LinearLrSchedulerConfig::new(1e-2, 1e-6, 10000));
 
-    let learner = LearnerBuilder::new(ARTIFACT_DIR)
+    let training = SupervisedTraining::new(ARTIFACT_DIR, dataloader_train, dataloader_valid)
         .metrics((AccuracyMetric::new(), LossMetric::new()))
         .metric_train_numeric(LearningRateMetric::new())
-        .with_file_checkpointer(CompactRecorder::new())
+        .with_default_checkpointers()
         .early_stopping(MetricEarlyStoppingStrategy::new(
-            &LossMetric::<B>::new(),
+            &LossMetric::new(),
             Aggregate::Mean,
             Direction::Lowest,
             Split::Valid,
             StoppingCondition::NoImprovementSince { n_epochs: 5 },
         ))
+        .with_progress_logger(
+            FileTrainingProgressLogger::new(format!("{ARTIFACT_DIR}/training_progress.log"))
+                .expect("Failed to create training progress log"),
+        )
         .num_epochs(config.num_epochs)
-        .summary()
-        .learning_strategy(burn::train::LearningStrategy::SingleDevice(device))
-        .build(model, config.optimizer.init(), lr_scheduler.init().unwrap());
+        .summary();
 
-    let result = learner.fit(dataloader_train, dataloader_valid);
+    let result = training.launch(Learner::new(
+        model,
+        config.optimizer.init(),
+        lr_scheduler.init().unwrap(),
+    ));
 
     let dataset_test_plain = Arc::new(MnistDataset::test());
-    let mut renderer = result.renderer;
 
-    let idents_tests = generate_idents(None);
+    let splits: Vec<_> = generate_idents(None)
+        .into_iter()
+        .map(|(ident, _)| {
+            let name = ident.to_string();
+            let dataset_test = DatasetIdent::prepare(ident, dataset_test_plain.clone());
+            let dataloader = DataLoaderBuilder::new(MnistBatcher::default())
+                .batch_size(config.batch_size)
+                .num_workers(2)
+                .build(dataset_test);
+            (name, dataloader)
+        })
+        .collect();
 
-    for (ident, _) in idents_tests {
-        let name = ident.to_string();
-        renderer = evaluate::<B::InnerBackend>(
-            name.as_str(),
-            ident,
-            result.model.clone(),
-            renderer,
-            dataset_test_plain.clone(),
-            config.batch_size,
-        );
-    }
+    let mut renderer = EvaluatorBuilder::new(ARTIFACT_DIR)
+        .renderer(result.renderer)
+        .metrics((AccuracyMetric::new(), LossMetric::new()))
+        .with_progress_logger(
+            FileEvaluationProgressLogger::new(format!("{ARTIFACT_DIR}/evaluation_progress.log"))
+                .expect("Failed to create evaluation progress log"),
+        )
+        .summary()
+        .build(result.model.clone())
+        .eval_all(splits);
 
     result
         .model
-        .save_file(
-            format!("{ARTIFACT_DIR}/model"),
-            &NoStdTrainingRecorder::new(),
-        )
+        .into_record()
+        .save(format!("{ARTIFACT_DIR}/model"))
         .expect("Failed to save trained model");
 
     config
@@ -140,37 +154,6 @@ pub fn run<B: AutodiffBackend>(device: B::Device) {
         .unwrap();
 
     renderer.manual_close();
-    core::mem::drop(renderer);
-
-    // Making sure the Terminal is resetted.
-    std::thread::sleep(Duration::from_secs(1));
-    if let Some(summary) = result.summary {
-        log::info!("{}", summary);
-        println!("{}", summary);
-    }
-}
-
-fn evaluate<B: Backend>(
-    name: &str,
-    ident: DatasetIdent,
-    model: Model<B>,
-    renderer: Box<dyn MetricsRenderer>,
-    dataset: impl Dataset<MnistItem> + 'static,
-    batch_size: usize,
-) -> Box<dyn MetricsRenderer> {
-    let batcher = MnistBatcher::default();
-    let dataset_test = DatasetIdent::prepare(ident, dataset);
-    let dataloader_test = DataLoaderBuilder::new(batcher)
-        .batch_size(batch_size)
-        .num_workers(2)
-        .build(dataset_test);
-
-    let evaluator = EvaluatorBuilder::new(ARTIFACT_DIR)
-        .renderer(renderer)
-        .metrics((AccuracyMetric::new(), LossMetric::new()))
-        .build(model);
-
-    evaluator.eval(name, dataloader_test)
 }
 
 enum DatasetIdent {
@@ -184,9 +167,11 @@ impl core::fmt::Display for DatasetIdent {
         match self {
             DatasetIdent::Plain => f.write_str("Plain")?,
             DatasetIdent::Transformed(items) => {
-                for i in items {
-                    f.write_fmt(format_args!("{i}"))?;
-                    f.write_str(" ")?;
+                for i in 0..items.len() {
+                    f.write_fmt(format_args!("{}", items[i]))?;
+                    if i < items.len() - 1 {
+                        f.write_str(" ")?;
+                    }
                 }
             }
             DatasetIdent::All => f.write_str("All")?,

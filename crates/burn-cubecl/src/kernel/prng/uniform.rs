@@ -1,34 +1,43 @@
-use burn_tensor::Shape;
-
-use crate::{CubeRuntime, element::CubeElement, ops::numeric::empty_device, tensor::CubeTensor};
+use crate::{CubeDevice, ops::numeric::empty_device_dtype, tensor::CubeTensor};
+use burn_backend::cubecl::dtype_to_storage_type;
+use burn_backend::{DType, Shape, TensorMetadata};
 
 /// Pseudo-random generator with uniform distribution
-pub fn random_uniform<R: CubeRuntime, E: CubeElement>(
+pub fn random_uniform(
     shape: Shape,
-    device: &R::Device,
-    lower_bound: E,
-    upper_bound: E,
-) -> CubeTensor<R> {
-    let client = R::client(device);
-    let output = empty_device::<R, E>(client.clone(), device.clone(), shape);
-    let output_handle = output.as_handle_ref();
+    device: &CubeDevice,
+    lower_bound: f32,
+    upper_bound: f32,
+    dtype: DType,
+) -> CubeTensor {
+    let client = device.client();
+    let output = empty_device_dtype(client.clone(), device.clone(), shape, dtype);
 
-    cubecl::random::random_uniform(&client, lower_bound, upper_bound, output_handle);
+    cubek::random::random_uniform(
+        &client,
+        lower_bound,
+        upper_bound,
+        output.clone().binding(),
+        dtype_to_storage_type(dtype),
+    )
+    .expect("Kernel to never fail");
 
     output
 }
 
 /// Pseudo-random generator for uniform distribution, based on
 /// another tensor.
-pub fn random_like_uniform<R: CubeRuntime, E: CubeElement>(
-    tensor: &CubeTensor<R>,
-    lower_bound: E,
-    upper_bound: E,
-) -> CubeTensor<R> {
+pub fn random_like_uniform(
+    tensor: &CubeTensor,
+    lower_bound: f32,
+    upper_bound: f32,
+    dtype: DType,
+) -> CubeTensor {
     random_uniform(
-        tensor.shape.clone(),
+        tensor.shape(),
         &tensor.device,
         lower_bound,
         upper_bound,
+        dtype,
     )
 }

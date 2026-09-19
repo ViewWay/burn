@@ -1,9 +1,9 @@
 use core::{marker::PhantomData, mem::transmute};
 
-use crate::{SharedArray, sharing::UnsafeSharedRef};
+use crate::{SharedArray, iter_range_par, run_par, sharing::UnsafeSharedRef};
 
-use burn_common::{iter_range_par, run_par};
-use burn_tensor::{DType, Element, ElementConversion};
+use burn_backend::DType;
+use burn_backend::{Element, ElementConversion};
 use bytemuck::Zeroable;
 use macerator::{Simd, VAdd, VDiv};
 use ndarray::{Array4, s};
@@ -106,7 +106,7 @@ mod nhwc {
                 let block = k % blocks;
                 let b = k / blocks;
 
-                let output = unsafe_shared_out.get();
+                let mut output = unsafe_shared_out.get();
 
                 let x = x.slice(s![b, .., .., ..]);
                 let out = output.slice_mut(s![b, .., .., ..]);
@@ -118,7 +118,7 @@ mod nhwc {
                 let ch = (k % num_simd_unblocked) * lanes + blocks_end;
                 let b = k / num_simd_unblocked;
 
-                let output = unsafe_shared_out.get();
+                let mut output = unsafe_shared_out.get();
 
                 let x = x.slice(s![b, .., .., ..]);
                 let out = output.slice_mut(s![b, .., .., ..]);
@@ -130,7 +130,7 @@ mod nhwc {
                 let ch = (k % remainder) + simd_end;
                 let b = k / remainder;
 
-                let output = unsafe_shared_out.get();
+                let mut output = unsafe_shared_out.get();
 
                 let x = x.slice(s![b, .., .., ..]);
                 let out = output.slice_mut(s![b, .., .., ..]);

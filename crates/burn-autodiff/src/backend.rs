@@ -1,15 +1,21 @@
 use crate::{
     checkpoint::strategy::{CheckpointStrategy, NoCheckpointing},
     grads::Gradients,
-    runtime::AutodiffClient,
     tensor::AutodiffTensor,
 };
-use alloc::{format, string::String};
-use burn_tensor::{
-    backend::{AutodiffBackend, Backend},
-    ops::{BoolTensor, IntTensor, QuantizedTensor},
-};
+use alloc::{format, string::String, vec::Vec};
 use core::marker::PhantomData;
+
+use burn_backend::{
+    backend::{
+        AutodiffBackend, Backend, BackendTypes, ExecutionError, InstallMemoryPoolsError,
+        MemoryPoolLayout, MemoryPoolUsage, ProfileDuration, ProfileOptions, ProfileToken,
+        SlicedPoolReport,
+    },
+    tensor::{BoolTensor, IntTensor, QuantizedTensor},
+};
+
+use burn_backend::distributed::{DistributedParamId, DistributedParams};
 
 /// Enable auto-differentiation on a backend.
 ///
@@ -21,21 +27,24 @@ pub struct Autodiff<B, C = NoCheckpointing> {
     _checkpoint_strategy: PhantomData<C>,
 }
 
-impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
+impl<B: BackendTypes, C: CheckpointStrategy> BackendTypes for Autodiff<B, C> {
     type Device = B::Device;
 
     type FloatTensorPrimitive = AutodiffTensor<B>;
-    type FloatElem = B::FloatElem;
 
     type IntTensorPrimitive = B::IntTensorPrimitive;
-    type IntElem = B::IntElem;
 
     type BoolTensorPrimitive = B::BoolTensorPrimitive;
-    type BoolElem = B::BoolElem;
 
     type QuantizedTensorPrimitive = B::QuantizedTensorPrimitive;
 
-    fn ad_enabled() -> bool {
+    // A replayed graph would skip re-recording the autodiff tape, so capture
+    // is not supported under autodiff.
+    type GraphPrimitive = burn_backend::GraphUnsupported;
+}
+
+impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
+    fn ad_enabled(_device: &Self::Device) -> bool {
         true
     }
 
@@ -47,20 +56,86 @@ impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
         B::seed(device, seed)
     }
 
-    fn sync(device: &B::Device) {
+    fn sync(device: &B::Device) -> Result<(), ExecutionError> {
         B::sync(device)
     }
 
-    fn memory_static_allocations<Output, Input, Func: Fn(Input) -> Output>(
+    fn profile<O: Send + 'static>(
+        device: &Self::Device,
+        options: ProfileOptions,
+        func: impl FnOnce() -> O + Send,
+    ) -> Result<(O, ProfileDuration), ExecutionError> {
+        B::profile(device, options, func)
+    }
+
+    fn profile_start(device: &Self::Device) -> Result<Option<ProfileToken>, ExecutionError> {
+        B::profile_start(device)
+    }
+
+    fn profile_end(
+        device: &Self::Device,
+        token: ProfileToken,
+        options: ProfileOptions,
+    ) -> Result<ProfileDuration, ExecutionError> {
+        B::profile_end(device, token, options)
+    }
+
+    fn profile_abandon(device: &Self::Device, token: ProfileToken) {
+        B::profile_abandon(device, token)
+    }
+
+    fn memory_persistent_allocations<
+        Output: Send,
+        Input: Send,
+        Func: Fn(Input) -> Output + Send,
+    >(
         device: &Self::Device,
         input: Input,
         func: Func,
     ) -> Output {
-        B::memory_static_allocations(device, input, func)
+        B::memory_persistent_allocations(device, input, func)
     }
 
     fn memory_cleanup(device: &Self::Device) {
         B::memory_cleanup(device)
+    }
+
+    fn memory_install_pools(
+        device: &Self::Device,
+        layout: MemoryPoolLayout,
+    ) -> Result<(), InstallMemoryPoolsError> {
+        B::memory_install_pools(device, layout)
+    }
+
+    fn memory_pool_report(device: &Self::Device) -> Option<Vec<SlicedPoolReport>> {
+        B::memory_pool_report(device)
+    }
+
+    fn memory_pool_usage(device: &Self::Device) -> Option<MemoryPoolUsage> {
+        B::memory_pool_usage(device)
+    }
+
+    fn staging<'a, Iter>(data: Iter, device: &Self::Device)
+    where
+        Iter: Iterator<Item = &'a mut burn_backend::TensorData>,
+    {
+        B::staging(data, device);
+    }
+
+    fn supports_dtype(device: &Self::Device, dtype: burn_std::DType) -> bool {
+        B::supports_dtype(device, dtype)
+    }
+
+    fn dtype_usage(device: &Self::Device, dtype: burn_std::DType) -> burn_backend::DTypeUsageSet {
+        B::dtype_usage(device, dtype)
+    }
+
+    fn device_count(type_id: u16) -> usize {
+        B::device_count(type_id)
+    }
+
+    fn flush(device: &Self::Device) {
+        B::flush(device)
     }
 }
 
@@ -69,20 +144,18 @@ impl<B: Backend, C: CheckpointStrategy> AutodiffBackend for Autodiff<B, C> {
     type Gradients = Gradients;
 
     fn backward(tensor: AutodiffTensor<B>) -> Gradients {
-        let client = tensor.node.client.clone();
-
-        AutodiffClient::backward::<B>(&client, tensor)
+        tensor.backward()
     }
 
     fn grad(tensor: &AutodiffTensor<B>, grads: &Gradients) -> Option<B::FloatTensorPrimitive> {
-        grads.get::<B>(tensor)
+        tensor.grad(grads)
     }
 
     fn grad_remove(
         tensor: &AutodiffTensor<B>,
         grads: &mut Gradients,
     ) -> Option<B::FloatTensorPrimitive> {
-        grads.remove::<B>(tensor)
+        tensor.grad_remove(grads)
     }
     fn inner(tensor: AutodiffTensor<B>) -> B::FloatTensorPrimitive {
         tensor.primitive
@@ -97,8 +170,7 @@ impl<B: Backend, C: CheckpointStrategy> AutodiffBackend for Autodiff<B, C> {
         grads: &mut Self::Gradients,
         grad: B::FloatTensorPrimitive,
     ) {
-        grads.remove::<B>(tensor);
-        grads.register::<B>(tensor.node.id, grad);
+        tensor.grad_replace(grads, grad);
     }
 
     fn int_inner(tensor: IntTensor<Self>) -> IntTensor<Self::InnerBackend> {
@@ -123,5 +195,20 @@ impl<B: Backend, C: CheckpointStrategy> AutodiffBackend for Autodiff<B, C> {
 
     fn q_from_inner(tensor: QuantizedTensor<Self::InnerBackend>) -> QuantizedTensor<Self> {
         tensor
+    }
+
+    fn set_distributed_params(
+        tensor: AutodiffTensor<B>,
+        param_id: DistributedParamId,
+    ) -> AutodiffTensor<B> {
+        tensor.grad_distributed(param_id)
+    }
+
+    fn distributed_params(tensor: &AutodiffTensor<B>) -> Option<DistributedParams> {
+        tensor.node.distributed_params.clone()
+    }
+
+    fn is_distributed(tensor: &AutodiffTensor<B>) -> bool {
+        tensor.node.distributed_params.is_some()
     }
 }

@@ -1,42 +1,49 @@
 use super::{
-    adaptive_avgpool::{adaptive_avg_pool2d, adaptive_avg_pool2d_backward},
+    adaptive_avgpool::{
+        adaptive_avg_pool2d, adaptive_avg_pool2d_backward, adaptive_avg_pool3d,
+        adaptive_avg_pool3d_backward,
+    },
     avgpool::{avg_pool2d, avg_pool2d_backward},
     conv::{conv_transpose2d, conv_transpose3d, conv2d, conv3d},
     deform_conv::{backward::deform_conv2d_backward, deform_conv2d},
-    interpolate::{bicubic_interpolate, bilinear_interpolate, nearest_interpolate},
+    interpolate::{
+        bicubic_interpolate, bilinear_interpolate, lanczos3_interpolate, nearest_interpolate,
+    },
     maxpool::{max_pool2d, max_pool2d_backward, max_pool2d_with_indices},
 };
+use crate::ops::interpolate::nearest_interpolate_backward;
 #[cfg(feature = "simd")]
 use crate::ops::simd::{
     avgpool::try_avg_pool2d_simd, conv::try_conv2d_simd, maxpool::try_max_pool2d_simd,
 };
 use crate::{
-    NdArray, SharedArray, element::FloatNdArrayElement, execute_with_int_dtype,
-    tensor::NdArrayTensor,
+    NdArray, SharedArray, execute_with_int_dtype, execute_with_int_out_dtype, tensor::NdArrayTensor,
 };
-use crate::{
-    element::{IntNdArrayElement, QuantElement},
-    ops::interpolate::nearest_interpolate_backward,
+use burn_backend::{
+    TensorMetadata,
+    ops::{attention::attention_fallback, conv::pad_asymmetric_conv_input, *},
+    tensor::FloatTensor,
 };
-use burn_tensor::{TensorMetadata, ops::*};
+use burn_std::IntDType;
 
 macro_rules! module_op {
     // Module op with inputs (inp), optional (opt) and arguments (args).
+    // Converts NdArrayStorage to SharedArray for compatibility with existing operations.
     (inp($($x:tt),+), opt($($opt:tt),*), $element:ident, $op:expr) => {{
         #[allow(unused_parens, unreachable_patterns)]
         match ($($x),+) {
             ($(NdArrayTensor::F32($x)),+) => {
                 type $element = f32;
                 $op(
-                    $($x),+
-                    $(, $opt.map(|o| match o { NdArrayTensor::F32(val) => val, _ => panic!("Optional argument type mismatch") }))*
+                    $($x.into_shared()),+
+                    $(, $opt.map(|o| match o { NdArrayTensor::F32(val) => val.into_shared(), _ => panic!("Optional argument type mismatch") }))*
                 )
             }
             ($(NdArrayTensor::F64($x)),+) => {
                 type $element = f64;
                 $op(
-                    $($x),+
-                    $(, $opt.map(|o| match o { NdArrayTensor::F64(val) => val, _ => panic!("Optional argument type mismatch") }))*
+                    $($x.into_shared()),+
+                    $(, $opt.map(|o| match o { NdArrayTensor::F64(val) => val.into_shared(), _ => panic!("Optional argument type mismatch") }))*
                 )
             }
             _ => panic!("Data type mismatch"),
@@ -44,18 +51,14 @@ macro_rules! module_op {
     }};
 }
 
-impl<E: FloatNdArrayElement, I: IntNdArrayElement, Q: QuantElement> ModuleOps<Self>
-    for NdArray<E, I, Q>
-where
-    NdArrayTensor: From<SharedArray<E>>,
-    NdArrayTensor: From<SharedArray<I>>,
-{
+impl ModuleOps<Self> for NdArray {
     fn conv2d(
         x: NdArrayTensor,
         weight: NdArrayTensor,
         bias: Option<NdArrayTensor>,
         options: ConvOptions<2>,
     ) -> NdArrayTensor {
+        let (x, options) = pad_asymmetric_conv_input::<NdArray, 2>(x, options);
         module_op!(inp(x, weight), opt(bias), E, |x, weight, bias| {
             #[cfg(feature = "simd")]
             let (x, weight, bias) = match try_conv2d_simd(x, weight, bias, options.clone()) {
@@ -136,14 +139,28 @@ where
         stride: [usize; 2],
         padding: [usize; 2],
         count_include_pad: bool,
+        ceil_mode: bool,
     ) -> FloatTensor<Self> {
         module_op!(inp(x), opt(), E, |x| {
             #[cfg(feature = "simd")]
-            let x = match try_avg_pool2d_simd(x, kernel_size, stride, padding, count_include_pad) {
+            let x = match if ceil_mode {
+                // SIMD path doesn't support ceil_mode yet, skip it
+                Err(x)
+            } else {
+                try_avg_pool2d_simd(x, kernel_size, stride, padding, count_include_pad)
+            } {
                 Ok(out) => return out.into(),
                 Err(x) => x,
             };
-            avg_pool2d::<E>(x, kernel_size, stride, padding, count_include_pad).into()
+            avg_pool2d::<E>(
+                x,
+                kernel_size,
+                stride,
+                padding,
+                count_include_pad,
+                ceil_mode,
+            )
+            .into()
         })
     }
 
@@ -154,6 +171,7 @@ where
         stride: [usize; 2],
         padding: [usize; 2],
         count_include_pad: bool,
+        ceil_mode: bool,
     ) -> FloatTensor<Self> {
         module_op!(inp(x, grad), opt(), E, |x, grad| avg_pool2d_backward::<E>(
             x,
@@ -161,7 +179,8 @@ where
             kernel_size,
             stride,
             padding,
-            count_include_pad
+            count_include_pad,
+            ceil_mode
         )
         .into())
     }
@@ -172,14 +191,20 @@ where
         stride: [usize; 2],
         padding: [usize; 2],
         dilation: [usize; 2],
+        ceil_mode: bool,
     ) -> FloatTensor<Self> {
         module_op!(inp(x), opt(), E, |x| {
             #[cfg(feature = "simd")]
-            let x = match try_max_pool2d_simd(x, kernel_size, stride, padding, dilation) {
+            let x = match if ceil_mode {
+                // SIMD path doesn't support ceil_mode yet, skip it
+                Err(x)
+            } else {
+                try_max_pool2d_simd(x, kernel_size, stride, padding, dilation)
+            } {
                 Ok(out) => return out.into(),
                 Err(x) => x,
             };
-            max_pool2d::<E>(x, kernel_size, stride, padding, dilation).into()
+            max_pool2d::<E>(x, kernel_size, stride, padding, dilation, ceil_mode).into()
         })
     }
 
@@ -189,11 +214,21 @@ where
         stride: [usize; 2],
         padding: [usize; 2],
         dilation: [usize; 2],
-    ) -> MaxPool2dWithIndices<NdArray<E, I, Q>> {
-        module_op!(inp(x), opt(), E, |x| {
-            let (output, indices) =
-                max_pool2d_with_indices::<E, I>(x, kernel_size, stride, padding, dilation);
-            MaxPool2dWithIndices::new(output.into(), indices.into())
+        ceil_mode: bool,
+        indices_dtype: IntDType,
+    ) -> MaxPool2dWithIndices<Self> {
+        execute_with_int_out_dtype!(indices_dtype, I, {
+            module_op!(inp(x), opt(), E, |x| {
+                let (output, indices) = max_pool2d_with_indices::<E, I>(
+                    x,
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    ceil_mode,
+                );
+                MaxPool2dWithIndices::new(output.into(), indices.into())
+            })
         })
     }
 
@@ -203,19 +238,21 @@ where
         stride: [usize; 2],
         padding: [usize; 2],
         dilation: [usize; 2],
+        ceil_mode: bool,
         output_grad: FloatTensor<Self>,
         indices: NdArrayTensor,
-    ) -> MaxPool2dBackward<NdArray<E, I, Q>> {
-        execute_with_int_dtype!(indices, I, |indices| {
+    ) -> MaxPool2dBackward<Self> {
+        execute_with_int_dtype!(indices, IntElem, |idx_s: SharedArray<IntElem>| {
             module_op!(inp(x, output_grad), opt(), E, |x, output_grad| {
-                let output = max_pool2d_backward::<E, I>(
+                let output = max_pool2d_backward::<E, IntElem>(
                     x,
                     kernel_size,
                     stride,
                     padding,
                     dilation,
+                    ceil_mode,
                     output_grad,
-                    indices,
+                    idx_s,
                 );
                 MaxPool2dBackward::new(output.into())
             })
@@ -239,6 +276,23 @@ where
         })
     }
 
+    fn adaptive_avg_pool3d(x: FloatTensor<Self>, output_size: [usize; 3]) -> FloatTensor<Self> {
+        module_op!(inp(x), opt(), E, |x| adaptive_avg_pool3d::<E>(
+            x,
+            output_size
+        )
+        .into())
+    }
+
+    fn adaptive_avg_pool3d_backward(
+        x: FloatTensor<Self>,
+        grad: FloatTensor<Self>,
+    ) -> FloatTensor<Self> {
+        module_op!(inp(x, grad), opt(), E, |x, grad| {
+            adaptive_avg_pool3d_backward::<E>(x, grad).into()
+        })
+    }
+
     fn interpolate(
         x: FloatTensor<Self>,
         output_size: [usize; 2],
@@ -252,17 +306,33 @@ where
                 )
                 .into())
             }
+            InterpolateMode::NearestExact => {
+                panic!("nearest exact interpolation is not supported for ndarray backend")
+            }
             InterpolateMode::Bilinear => {
+                let align_corners = options.align_corners;
                 module_op!(inp(x), opt(), E, |x| bilinear_interpolate::<E>(
                     x,
-                    output_size
+                    output_size,
+                    align_corners
                 )
                 .into())
             }
             InterpolateMode::Bicubic => {
+                let align_corners = options.align_corners;
                 module_op!(inp(x), opt(), E, |x| bicubic_interpolate::<E>(
                     x,
-                    output_size
+                    output_size,
+                    align_corners
+                )
+                .into())
+            }
+            InterpolateMode::Lanczos3 => {
+                let align_corners = options.align_corners;
+                module_op!(inp(x), opt(), E, |x| lanczos3_interpolate::<E>(
+                    x,
+                    output_size,
+                    align_corners
                 )
                 .into())
             }
@@ -279,11 +349,17 @@ where
             InterpolateMode::Nearest => module_op!(inp(x, grad), opt(), E, |x, grad| {
                 nearest_interpolate_backward::<E>(x, grad, output_size).into()
             }),
+            InterpolateMode::NearestExact => {
+                panic!("nearest exact interpolation backward is not supported for ndarray backend")
+            }
             InterpolateMode::Bilinear => {
                 panic!("bilinear interpolation backward is not supported for ndarray backend")
             }
             InterpolateMode::Bicubic => {
                 panic!("bicubic interpolation backward is not supported for ndarray backend")
+            }
+            InterpolateMode::Lanczos3 => {
+                panic!("lanczos3 interpolation backward is not supported for ndarray backend")
             }
         }
     }
@@ -309,5 +385,16 @@ where
         module_op!(inp(x, weight), opt(bias), E, |x, weight, bias| {
             conv_transpose3d::<E>(x, weight, bias, options).into()
         })
+    }
+
+    fn attention(
+        query: FloatTensor<Self>,
+        key: FloatTensor<Self>,
+        value: FloatTensor<Self>,
+        mask: Option<burn_backend::tensor::BoolTensor<Self>>,
+        attn_bias: Option<FloatTensor<Self>>,
+        options: AttentionModuleOptions,
+    ) -> FloatTensor<Self> {
+        attention_fallback::<Self>(query, key, value, mask, attn_bias, options)
     }
 }

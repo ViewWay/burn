@@ -1,108 +1,40 @@
-#[cfg(any(
-    feature = "ndarray",
-    feature = "ndarray-blas-netlib",
-    feature = "ndarray-blas-openblas",
-    feature = "ndarray-blas-accelerate",
-))]
-mod ndarray {
-    use burn::backend::{
-        Autodiff,
-        ndarray::{NdArray, NdArrayDevice},
-    };
-    use mnist::training;
+use burn::tensor::Device;
+use mnist::training;
 
-    pub fn run() {
-        let device = NdArrayDevice::Cpu;
-        training::run::<Autodiff<NdArray>>(device);
-    }
-}
+#[allow(unreachable_code)]
+fn select_device() -> Device {
+    #[cfg(feature = "flex")]
+    return Device::flex();
 
-#[cfg(feature = "tch-gpu")]
-mod tch_gpu {
-    use burn::backend::{
-        Autodiff,
-        libtorch::{LibTorch, LibTorchDevice},
-    };
-    use mnist::training;
+    #[cfg(all(feature = "tch-gpu", not(target_os = "macos")))]
+    return Device::libtorch_cuda(burn::tensor::DeviceIndex::Default);
 
-    pub fn run() {
-        #[cfg(not(target_os = "macos"))]
-        let device = LibTorchDevice::Cuda(0);
-        #[cfg(target_os = "macos")]
-        let device = LibTorchDevice::Mps;
+    #[cfg(all(feature = "tch-gpu", target_os = "macos"))]
+    return Device::libtorch_mps();
 
-        training::run::<Autodiff<LibTorch>>(device);
-    }
-}
+    #[cfg(feature = "tch-cpu")]
+    return Device::libtorch();
 
-#[cfg(any(feature = "wgpu", feature = "metal", feature = "vulkan"))]
-mod wgpu {
-    use burn::backend::{
-        Autodiff,
-        wgpu::{Wgpu, WgpuDevice},
-    };
-    use mnist::training;
+    #[cfg(feature = "vulkan")]
+    return Device::vulkan(burn::tensor::DeviceKind::DefaultDevice);
+    #[cfg(feature = "metal")]
+    return Device::metal(burn::tensor::DeviceKind::DefaultDevice);
+    #[cfg(feature = "wgpu")]
+    return Device::wgpu(burn::tensor::DeviceKind::DefaultDevice);
 
-    pub fn run() {
-        let device = WgpuDevice::default();
-        training::run::<Autodiff<Wgpu>>(device);
-    }
-}
+    #[cfg(feature = "cuda")]
+    return Device::cuda(burn::tensor::DeviceIndex::Default);
 
-#[cfg(feature = "cuda")]
-mod cuda {
-    use burn::backend::{
-        Autodiff,
-        cuda::{Cuda, CudaDevice},
-    };
-    use mnist::training;
+    #[cfg(feature = "rocm")]
+    return Device::rocm(burn::tensor::DeviceIndex::Default);
 
-    pub fn run() {
-        let devices = CudaDevice::default();
-        training::run::<Autodiff<Cuda>>(devices);
-    }
-}
+    #[cfg(feature = "remote")]
+    return Device::remote_websocket("ws://localhost:3000", 0);
 
-#[cfg(feature = "tch-cpu")]
-mod tch_cpu {
-    use burn::backend::{
-        Autodiff,
-        libtorch::{LibTorch, LibTorchDevice},
-    };
-    use mnist::training;
-
-    pub fn run() {
-        let device = LibTorchDevice::Cpu;
-        training::run::<Autodiff<LibTorch>>(device);
-    }
-}
-
-#[cfg(feature = "remote")]
-mod remote {
-    use burn::backend::{Autodiff, RemoteBackend};
-    use mnist::training;
-
-    pub fn run() {
-        training::run::<Autodiff<RemoteBackend>>(Default::default());
-    }
+    unreachable!("At least one backend will be selected.")
 }
 
 fn main() {
-    #[cfg(any(
-        feature = "ndarray",
-        feature = "ndarray-blas-netlib",
-        feature = "ndarray-blas-openblas",
-        feature = "ndarray-blas-accelerate",
-    ))]
-    ndarray::run();
-    #[cfg(feature = "tch-gpu")]
-    tch_gpu::run();
-    #[cfg(feature = "tch-cpu")]
-    tch_cpu::run();
-    #[cfg(any(feature = "wgpu", feature = "metal", feature = "vulkan"))]
-    wgpu::run();
-    #[cfg(feature = "cuda")]
-    cuda::run();
-    #[cfg(feature = "remote")]
-    remote::run();
+    let device = select_device();
+    training::run(device);
 }

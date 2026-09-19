@@ -1,23 +1,18 @@
 use crate::FloatTensor;
 
-use super::{AutodiffBackend, Backend};
+use super::Backend;
 use burn::{
     backend::{
+        TensorMetadata,
         autodiff::{
-            Autodiff, NodeID,
+            Autodiff, NodeId,
             checkpoint::{base::Checkpointer, strategy::CheckpointStrategy},
             grads::Gradients,
             ops::{Backward, Ops, OpsKind, broadcast_shape},
         },
-        wgpu::{BoolElement, CubeBackend, FloatElement, IntElement, WgpuRuntime},
     },
-    tensor::{Shape, TensorMetadata},
+    tensor::Shape,
 };
-
-impl<F: FloatElement, I: IntElement, BT: BoolElement> AutodiffBackend
-    for Autodiff<CubeBackend<WgpuRuntime, F, I, BT>>
-{
-}
 
 // Implement our custom backend trait for any backend that also implements our custom backend trait.
 //
@@ -42,7 +37,7 @@ impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
             // Note that we could improve the performance further by only keeping the state of
             // tensors that are tracked, improving memory management, but for simplicity, we avoid
             // that part.
-            type State = (NodeID, NodeID, FloatTensor<B>, Shape);
+            type State = (NodeId, NodeId, FloatTensor<B>, Shape);
 
             fn backward(
                 self,
@@ -98,11 +93,12 @@ impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
             }
         }
 
-        // Prepare a stateful operation with each variable node and corresponding graph.
+        // Prepare a stateful operation, keeping its inputs alive through registration.
+        // `node()` returns a guard that `prep.finish` releases after registering the output.
         //
         // Each node can be fetched with `ops.parents` in the same order as defined here.
         match FusedMatmulAddReluBackward
-            .prepare::<C>([lhs.node.clone(), rhs.node.clone(), bias.node.clone()])
+            .prepare::<C>([lhs.node(), rhs.node(), bias.node()])
             // Marks the operation as compute bound, meaning it will save its
             // state instead of recomputing itself during checkpointing
             .compute_bound()
@@ -113,17 +109,17 @@ impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
 
                 // The state consists of what will be needed for this operation's backward pass.
                 // Since we need the parents' outputs, we must checkpoint their ids to retrieve their node
-                // output at the beginning of the backward. We can also save utilitary data such as the bias shape
+                // output at the beginning of the backward. We can also save utility data such as the bias shape
                 // If we also need this operation's output, we can either save it in the state or recompute it
                 // during the backward pass. Here we choose to save it in the state because it's a compute bound operation.
                 let lhs_state = prep.checkpoint(&lhs);
                 let rhs_state = prep.checkpoint(&rhs);
-                let bias_shape = bias.primitive.shape();
+                let bias_shape = bias.primitive().shape();
 
                 let output = B::fused_matmul_add_relu(
-                    lhs.primitive.clone(),
-                    rhs.primitive.clone(),
-                    bias.primitive,
+                    lhs.primitive().clone(),
+                    rhs.primitive().clone(),
+                    bias.into_primitive(),
                 );
 
                 let state = (lhs_state, rhs_state, output.clone(), bias_shape);
@@ -133,7 +129,11 @@ impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
             OpsKind::UnTracked(prep) => {
                 // When no node is tracked, we can just compute the original operation without
                 // keeping any state.
-                let output = B::fused_matmul_add_relu(lhs.primitive, rhs.primitive, bias.primitive);
+                let output = B::fused_matmul_add_relu(
+                    lhs.into_primitive(),
+                    rhs.into_primitive(),
+                    bias.into_primitive(),
+                );
                 prep.finish(output)
             }
         }

@@ -1,5 +1,5 @@
 #![warn(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! A library for training neural networks using the burn crate.
 
@@ -20,6 +20,8 @@ pub mod logger;
 /// The metric module.
 pub mod metric;
 
+pub use metric::processor::*;
+
 mod learner;
 
 pub use learner::*;
@@ -28,12 +30,10 @@ mod evaluator;
 
 pub use evaluator::*;
 
-#[cfg(test)]
-pub(crate) type TestBackend = burn_ndarray::NdArray<f32>;
+pub use components::*;
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::TestBackend;
     use burn_core::{prelude::Tensor, tensor::Bool};
     use std::default::Default;
 
@@ -52,7 +52,7 @@ pub(crate) mod tests {
     /// classification metrics testing
     pub fn dummy_classification_input(
         classification_type: &ClassificationType,
-    ) -> (Tensor<TestBackend, 2>, Tensor<TestBackend, 2, Bool>) {
+    ) -> (Tensor<2>, Tensor<2, Bool>) {
         match classification_type {
             ClassificationType::Binary => {
                 (

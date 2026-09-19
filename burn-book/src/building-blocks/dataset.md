@@ -54,7 +54,7 @@ found at the [API reference](https://burn.dev/docs/burn/data/dataset/transform/i
 
 ```rust, ignore
 type DbPedia = SqliteDataset<DbPediaItem>;
-let dataset: DbPedia = HuggingfaceDatasetLoader::new("dbpedia_14")
+let dataset: DbPedia = HuggingfaceDatasetLoader::new("fancyzhx/dbpedia_14")
         .dataset("train").
         .unwrap();
 
@@ -128,7 +128,7 @@ dataset to use should be based on the dataset's size as well as its intended pur
 | Storage            | Description                                                                                                                                          |
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `InMemDataset`     | In-memory dataset that uses a vector to store items. Well-suited for smaller datasets.                                                               |
-| `SqliteDataset`    | Dataset that uses [SQLite](https://www.sqlite.org/) to index items that can be saved in a simple SQL database file. Well-suited for larger datasets. |
+| `SqliteDataset`    | Dataset that uses [Turso](https://turso.tech/) to index items that can be saved in a simple SQLite database file. Well-suited for larger datasets.   |
 | `DataframeDataset` | Dataset that uses [Polars](https://www.pola.rs/) dataframe to store and manage data. Well-suited for efficient data manipulation and analysis.       |
 
 ## Sources
@@ -140,7 +140,7 @@ For now, there are only a couple of dataset sources available with Burn, but mor
 You can easily import any Hugging Face dataset with Burn. We use SQLite as the storage to avoid
 downloading the model each time or starting a Python process. You need to know the format of each
 item in the dataset beforehand. Here's an example with the
-[dbpedia dataset](https://huggingface.co/datasets/dbpedia_14).
+[dbpedia dataset](https://huggingface.co/datasets/fancyzhx/dbpedia_14).
 
 ```rust, ignore
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -151,7 +151,7 @@ pub struct DbPediaItem {
 }
 
 fn main() {
-    let dataset: SqliteDataset<DbPediaItem> = HuggingfaceDatasetLoader::new("dbpedia_14")
+    let dataset: SqliteDataset<DbPediaItem> = HuggingfaceDatasetLoader::new("fancyzhx/dbpedia_14")
         .dataset("train") // The training split.
         .unwrap();
 }
@@ -280,7 +280,7 @@ storage. At this point, the dataset could be naively iterated over to provide th
 sample to process at a time, but this is not very efficient.
 
 Instead, we collect multiple samples that the model can process as a _batch_ to fully leverage
-modern hardware (e.g., GPUs - which have impressing parallel processing capabilities). Since each
+modern hardware (e.g., GPUs - which have impressive parallel processing capabilities). Since each
 data sample in the dataset can be collected independently, the data loading is typically done in
 parallel to further speed things up. In this case, we parallelize the data loading using a
 multi-threaded `BatchDataLoader` to obtain a sequence of items from the `Dataset` implementation.
@@ -407,10 +407,9 @@ impl MnistDataset {
 #    /// Download the MNIST dataset files from the web.
 #    /// Panics if the download cannot be completed or the content of the file cannot be written to disk.
 #    fn download(split: &str) -> PathBuf {
-#        // Dataset files are stored un the burn-dataset cache directory
-#        let cache_dir = dirs::home_dir()
-#            .expect("Could not get home directory")
-#            .join(".cache")
+#        // Dataset files are stored in the burn-dataset cache directory
+#        let cache_dir = dirs::cache_dir()
+#            .expect("Could not get cache directory")
 #            .join("burn-dataset");
 #        let split_dir = cache_dir.join("mnist").join(split);
 #

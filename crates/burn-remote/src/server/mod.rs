@@ -1,7 +1,19 @@
-pub(crate) mod processor;
+pub(crate) mod local_comm;
+pub(crate) mod pump;
+pub(crate) mod service;
 pub(crate) mod session;
-pub(crate) mod stream;
+pub(crate) mod spawn;
+pub(crate) mod transfer;
+pub(crate) mod worker;
 
-mod base;
+mod builder;
+mod logging;
 
-pub use base::{start_websocket, start_websocket_async};
+pub use builder::{Channel, RemoteServerBuilder};
+pub use burn_router::{CustomOpHandler, CustomOpRegistry};
+pub use logging::ServerLogging;
+
+#[cfg(feature = "iroh")]
+pub use crate::transport::iroh::protocol::{
+    AllowAll, AuthorizationRequest, IrohRemoteProtocol, PeerAuthorizer, RemoteProtocol,
+};

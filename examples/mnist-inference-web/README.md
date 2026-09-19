@@ -12,7 +12,7 @@ This crate demonstrates how to run an MNIST-trained model in the browser for inf
    ./build-for-web.sh {backend}
    ```
 
-   The backend can either be `ndarray` or `wgpu`. Note that `wgpu` only works for browsers with support for WebGPU.
+   The backend can either be `flex` or `wgpu`. Note that `wgpu` only works for browsers with support for WebGPU.
 
 2. Run the server
 
@@ -24,12 +24,13 @@ This crate demonstrates how to run an MNIST-trained model in the browser for inf
 
 ## Design
 
-The inference components of `burn` with the `ndarray` backend can be built with `#![no_std]`. This
+The inference components of `burn` with the `flex` backend can be built with `#![no_std]`. This
 makes it possible to build and run the model with the `wasm32-unknown-unknown` target without a
 special system library, such as [WASI](https://wasi.dev/). (See [Cargo.toml](./Cargo.toml) on how to
 include burn dependencies without `std`).
 
-For this demo, we use trained parameters (`model.bin`) and model (`model.rs`) from the
+For this demo, we use trained parameters (`model.bpk`, in the burnpack format) and model
+(`model.rs`) from the
 [`burn` MNIST example](https://github.com/tracel-ai/burn/tree/main/examples/mnist).
 
 The inference API for JavaScript is exposed with the help of

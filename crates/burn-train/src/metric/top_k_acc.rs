@@ -1,36 +1,35 @@
-use core::marker::PhantomData;
 use std::sync::Arc;
 
 use super::state::{FormatOptions, NumericMetricState};
-use super::{MetricEntry, MetricMetadata};
-use crate::metric::{Metric, MetricName, Numeric};
-use burn_core::tensor::backend::Backend;
-use burn_core::tensor::{ElementConversion, Int, Tensor};
+use super::{MetricMetadata, SerializedEntry};
+use crate::metric::{
+    Metric, MetricAttributes, MetricName, Numeric, NumericAttributes, NumericEntry,
+};
+use burn_core::tensor::{Int, Tensor};
 
 /// The Top-K accuracy metric.
 ///
 /// For K=1, this is equivalent to the [accuracy metric](`super::acc::AccuracyMetric`).
 #[derive(Default, Clone)]
-pub struct TopKAccuracyMetric<B: Backend> {
+pub struct TopKAccuracyMetric {
     name: Arc<String>,
     k: usize,
     state: NumericMetricState,
     /// If specified, targets equal to this value will be considered padding and will not count
     /// towards the metric
     pad_token: Option<usize>,
-    _b: PhantomData<B>,
 }
 
 /// The [top-k accuracy metric](TopKAccuracyMetric) input type.
 #[derive(new)]
-pub struct TopKAccuracyInput<B: Backend> {
+pub struct TopKAccuracyInput {
     /// The outputs (batch_size, num_classes)
-    outputs: Tensor<B, 2>,
+    outputs: Tensor<2>,
     /// The labels (batch_size)
-    targets: Tensor<B, 1, Int>,
+    targets: Tensor<1, Int>,
 }
 
-impl<B: Backend> TopKAccuracyMetric<B> {
+impl TopKAccuracyMetric {
     /// Creates the metric.
     pub fn new(k: usize) -> Self {
         Self {
@@ -47,31 +46,31 @@ impl<B: Backend> TopKAccuracyMetric<B> {
     }
 }
 
-impl<B: Backend> Metric for TopKAccuracyMetric<B> {
-    type Input = TopKAccuracyInput<B>;
+impl Metric for TopKAccuracyMetric {
+    type Input = TopKAccuracyInput;
 
-    fn update(&mut self, input: &TopKAccuracyInput<B>, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(&mut self, input: &TopKAccuracyInput, _metadata: &MetricMetadata) -> SerializedEntry {
         let [batch_size, _n_classes] = input.outputs.dims();
 
-        let targets = input.targets.clone().to_device(&B::Device::default());
+        let targets = input.targets.clone();
 
         let outputs = input
             .outputs
             .clone()
             .argsort_descending(1)
             .narrow(1, 0, self.k)
-            .to_device(&B::Device::default())
             .reshape([batch_size, self.k]);
 
         let (targets, num_pad) = match self.pad_token {
             Some(pad_token) => {
                 // we ignore the samples where the target is equal to the pad token
-                let mask = targets.clone().equal_elem(pad_token as i64);
-                let num_pad = mask.clone().int().sum().into_scalar().elem::<f64>();
+                let mask = targets.clone().equal_scalar(pad_token as i64);
+                let num_pad = mask.clone().int().sum().into_scalar::<i64>() as usize;
                 (targets.clone().mask_fill(mask, -1_i64), num_pad)
             }
-            None => (targets.clone(), 0_f64),
+            None => (targets.clone(), 0),
         };
+        let valid_count = batch_size - num_pad;
 
         let accuracy = targets
             .reshape([batch_size, 1])
@@ -79,17 +78,18 @@ impl<B: Backend> Metric for TopKAccuracyMetric<B> {
             .equal(outputs)
             .int()
             .sum()
-            .into_scalar()
-            .elem::<f64>()
-            / (batch_size as f64 - num_pad);
+            .into_scalar::<f64>()
+            / valid_count as f64;
 
-        self.state.update(
-            100.0 * accuracy,
-            batch_size,
-            FormatOptions::new(self.name()).unit("%").precision(2),
-        )
+        self.state.update(100.0 * accuracy, valid_count);
+        self.state
+            .compute_update(FormatOptions::new(self.name()).unit("%").precision(2))
     }
 
+    fn compute(&mut self) -> SerializedEntry {
+        self.state
+            .compute_final(FormatOptions::new(self.name()).unit("%").precision(2))
+    }
     fn clear(&mut self) {
         self.state.reset()
     }
@@ -97,23 +97,38 @@ impl<B: Backend> Metric for TopKAccuracyMetric<B> {
     fn name(&self) -> MetricName {
         self.name.clone()
     }
+
+    fn attributes(&self) -> MetricAttributes {
+        NumericAttributes {
+            unit: Some("%".to_string()),
+            higher_is_better: true,
+        }
+        .into()
+    }
 }
 
-impl<B: Backend> Numeric for TopKAccuracyMetric<B> {
-    fn value(&self) -> super::NumericEntry {
-        self.state.value()
+impl Numeric for TopKAccuracyMetric {
+    fn value(&self) -> Option<NumericEntry> {
+        Some(self.state.current_value())
+    }
+
+    fn running_value(&self) -> Option<NumericEntry> {
+        Some(self.state.running_value())
+    }
+
+    fn final_value(&self) -> NumericEntry {
+        self.state.final_value()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestBackend;
 
     #[test]
     fn test_accuracy_without_padding() {
         let device = Default::default();
-        let mut metric = TopKAccuracyMetric::<TestBackend>::new(2);
+        let mut metric = TopKAccuracyMetric::new(2);
         let input = TopKAccuracyInput::new(
             Tensor::from_data(
                 [
@@ -128,13 +143,13 @@ mod tests {
         );
 
         let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert_eq!(50.0, metric.value().current());
+        assert_eq!(50.0, metric.value().unwrap().current());
     }
 
     #[test]
     fn test_accuracy_with_padding() {
         let device = Default::default();
-        let mut metric = TopKAccuracyMetric::<TestBackend>::new(2).with_pad_token(3);
+        let mut metric = TopKAccuracyMetric::new(2).with_pad_token(3);
         let input = TopKAccuracyInput::new(
             Tensor::from_data(
                 [
@@ -152,14 +167,40 @@ mod tests {
         );
 
         let _entry = metric.update(&input, &MetricMetadata::fake());
-        assert_eq!(50.0, metric.value().current());
+        assert_eq!(50.0, metric.value().unwrap().current());
+    }
+
+    #[test]
+    fn test_accuracy_epoch_aggregation_excludes_padding() {
+        let device = Default::default();
+        let mut metric = TopKAccuracyMetric::new(1).with_pad_token(2);
+
+        // One valid, correct sample and three padding samples.
+        metric.update(
+            &TopKAccuracyInput::new(
+                Tensor::from_data([[0.9, 0.1], [0.9, 0.1], [0.9, 0.1], [0.9, 0.1]], &device),
+                Tensor::from_data([0, 2, 2, 2], &device),
+            ),
+            &MetricMetadata::fake(),
+        );
+        // Four valid, incorrect samples.
+        metric.update(
+            &TopKAccuracyInput::new(
+                Tensor::from_data([[0.9, 0.1]; 4], &device),
+                Tensor::from_data([1, 1, 1, 1], &device),
+            ),
+            &MetricMetadata::fake(),
+        );
+
+        // One correct prediction out of five valid samples.
+        assert_eq!(20.0, metric.final_value().current());
     }
 
     #[test]
     fn test_parameterized_unique_name() {
-        let metric_a = TopKAccuracyMetric::<TestBackend>::new(2);
-        let metric_b = TopKAccuracyMetric::<TestBackend>::new(1);
-        let metric_c = TopKAccuracyMetric::<TestBackend>::new(2);
+        let metric_a = TopKAccuracyMetric::new(2);
+        let metric_b = TopKAccuracyMetric::new(1);
+        let metric_c = TopKAccuracyMetric::new(2);
 
         assert_ne!(metric_a.name(), metric_b.name());
         assert_eq!(metric_a.name(), metric_c.name());

@@ -1,4 +1,5 @@
 use crate::Dataset;
+use crate::DatasetError;
 use crate::transform::RngSource;
 use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
@@ -14,7 +15,6 @@ use std::sync::Arc;
 /// # Returns
 ///
 /// A vector containing indices from 0 to size - 1.
-// TODO: lift/unify `burn::tensor::indexing` to `burn::core:indexing`; move this there.
 #[inline(always)]
 pub fn iota(size: usize) -> Vec<usize> {
     (0..size).collect()
@@ -29,7 +29,6 @@ pub fn iota(size: usize) -> Vec<usize> {
 /// # Returns
 ///
 /// A vector of shuffled indices.
-// TODO: lift/unify `burn::tensor::indexing` to `burn::core:indexing`; move this there.
 #[inline(always)]
 pub fn shuffled_indices(size: usize, rng: &mut StdRng) -> Vec<usize> {
     let mut indices = iota(size);
@@ -179,7 +178,7 @@ where
     ///
     /// * `start` - The start of the range.
     /// * `end` - The end of the range (exclusive).
-    // TODO: RangeArg in burn-tensor should be lifted to burn-common; this should use RangeArg.
+    // TODO: SliceArg in burn-tensor should be lifted to burn-std; this should use SliceArg.
     pub fn slice(&self, start: usize, end: usize) -> Self {
         Self::from_indices_unchecked(self.wrapped.clone(), self.indices[start..end].to_vec())
     }
@@ -227,9 +226,29 @@ where
     D: Dataset<I>,
     I: Clone + Send + Sync,
 {
-    fn get(&self, index: usize) -> Option<I> {
-        let index = self.indices.get(index)?;
-        self.wrapped.get(*index)
+    fn get(&self, index: usize) -> Result<I, DatasetError> {
+        let Some(&index) = self.indices.get(index) else {
+            panic!(
+                "Index out of bounds for SelectionDataset: {index} >= {}",
+                self.indices.len()
+            );
+        };
+        self.wrapped.get(index)
+    }
+
+    fn get_many(&self, indexes: Vec<usize>) -> Result<Vec<I>, DatasetError> {
+        let translated: Vec<usize> = indexes
+            .into_iter()
+            .map(|i| {
+                self.indices.get(i).copied().unwrap_or_else(|| {
+                    panic!(
+                        "Index out of bounds for SelectionDataset: {i} >= {}",
+                        self.indices.len()
+                    )
+                })
+            })
+            .collect();
+        self.wrapped.get_many(translated)
     }
 
     fn len(&self) -> usize {
@@ -252,11 +271,13 @@ mod tests {
     }
 
     #[test]
-    fn test_shuffled_indices() {
+    fn test_shuffled_indices_same_seed_is_deterministic() {
         let size = 10;
 
         let mut rng1 = StdRng::seed_from_u64(10);
-        let mut rng2 = rng1.clone();
+        // `StdRng` is no longer `Clone`, so its internal state cannot be duplicated.
+        // To test determinism, we must explicitly create a second RNG from the same seed.
+        let mut rng2 = StdRng::seed_from_u64(10);
 
         let mut expected = iota(size);
         expected.shuffle(&mut rng1);
@@ -264,6 +285,22 @@ mod tests {
         let indices = shuffled_indices(size, &mut rng2);
 
         assert_eq!(indices, expected);
+    }
+
+    #[test]
+    fn test_shuffled_indices_forked_rngs_differ() {
+        let size = 10;
+
+        let mut rng1 = StdRng::seed_from_u64(10);
+        let mut rng2 = rng1.fork();
+
+        let mut a = iota(size);
+        let mut b = iota(size);
+
+        a.shuffle(&mut rng1);
+        b.shuffle(&mut rng2);
+
+        assert_ne!(a, b);
     }
 
     #[should_panic(expected = "Index out of bounds for wrapped dataset size: 300 >= 27")]
@@ -288,15 +325,44 @@ mod tests {
 
         assert_eq!(&selection.indices, &indices);
 
-        let items = selection.iter().collect::<Vec<_>>();
+        let items = selection.iter().map(Result::unwrap).collect::<Vec<_>>();
 
         assert_eq!(items, expected);
     }
 
     #[test]
+    fn test_selection_dataset_get_many() {
+        let source_dataset = FakeDataset::<String>::new(27);
+
+        let indices: Vec<usize> = vec![15, 1, 12, 12];
+        let selection = SelectionDataset::from_indices_checked(source_dataset, indices);
+
+        // Local indices, out of order and with a duplicate, mapping through `selection.indices`.
+        let requested = vec![3, 0, 2, 0];
+        let expected: Vec<String> = requested
+            .iter()
+            .map(|&i| selection.get(i).unwrap())
+            .collect();
+
+        let items = selection.get_many(requested).unwrap();
+
+        assert_eq!(items, expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "Index out of bounds for SelectionDataset: 4 >= 4")]
+    fn test_selection_dataset_get_many_out_of_bounds() {
+        let source_dataset = FakeDataset::<String>::new(27);
+        let indices: Vec<usize> = vec![15, 1, 12, 12];
+        let selection = SelectionDataset::from_indices_checked(source_dataset, indices);
+
+        let _ = selection.get_many(vec![0, 4]);
+    }
+
+    #[test]
     fn test_shuffled_dataset() {
         let dataset = FakeDataset::<String>::new(27);
-        let source_items = dataset.iter().collect::<Vec<_>>();
+        let source_items = dataset.iter().map(Result::unwrap).collect::<Vec<_>>();
 
         let selection = SelectionDataset::new_shuffled(dataset, 42);
 
@@ -309,13 +375,16 @@ mod tests {
             .iter()
             .map(|&i| source_items[i].to_string())
             .collect();
-        assert_eq!(&selection.iter().collect::<Vec<_>>(), &expected_items);
+        assert_eq!(
+            &selection.iter().map(Result::unwrap).collect::<Vec<_>>(),
+            &expected_items
+        );
     }
 
     #[test]
     fn test_slice() {
         let dataset = FakeDataset::<String>::new(27);
-        let source_items = dataset.iter().collect::<Vec<_>>();
+        let source_items = dataset.iter().map(Result::unwrap).collect::<Vec<_>>();
 
         let selection = SelectionDataset::new_select_all(dataset);
 
@@ -328,8 +397,8 @@ mod tests {
         #[allow(clippy::needless_range_loop)]
         for i in start..end {
             assert_eq!(
-                sliced_selection.get(i - start),
-                Some(source_items[i].to_string())
+                sliced_selection.get(i - start).unwrap(),
+                source_items[i].to_string()
             );
         }
     }
@@ -337,14 +406,14 @@ mod tests {
     #[test]
     fn test_split() {
         let dataset = FakeDataset::<String>::new(28);
-        let source_items = dataset.iter().collect::<Vec<_>>();
+        let source_items = dataset.iter().map(Result::unwrap).collect::<Vec<_>>();
 
         let selection = SelectionDataset::new_select_all(dataset);
 
         let split_contents: Vec<Vec<_>> = selection
             .split(3)
             .iter()
-            .map(|d| d.iter().collect::<Vec<_>>())
+            .map(|d| d.iter().map(Result::unwrap).collect::<Vec<_>>())
             .collect();
         assert_eq!(
             split_contents,

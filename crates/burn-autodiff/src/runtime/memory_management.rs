@@ -1,16 +1,20 @@
 use crate::{
-    NodeID,
+    NodeId,
     collections::{HashMap, HashSet},
+    graph::Parent,
     tensor::NodeRefCount,
 };
-use alloc::{borrow::ToOwned, sync::Arc, vec, vec::Vec};
+use alloc::{borrow::ToOwned, vec, vec::Vec};
+
+use burn_std::sync::Arc;
+
 use core::mem;
 
 #[derive(Default, Debug)]
 pub struct GraphMemoryManagement {
-    nodes: HashMap<NodeRefCount, Vec<NodeID>>,
-    leaves: HashSet<NodeID>,
-    statuses: HashMap<NodeID, NodeMemoryStatus>,
+    nodes: HashMap<NodeRefCount, Vec<Parent>>,
+    leaves: HashSet<NodeId>,
+    statuses: HashMap<NodeId, NodeMemoryStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,20 +25,26 @@ enum NodeMemoryStatus {
 }
 
 impl GraphMemoryManagement {
+    pub fn extend(&mut self, other: Self) {
+        self.nodes.extend(other.nodes);
+        self.leaves.extend(other.leaves);
+        self.statuses.extend(other.statuses);
+    }
+
     /// Register a new node with its parent.
-    pub fn register(&mut self, node: NodeRefCount, parents: Vec<NodeID>) {
+    pub fn register(&mut self, node: NodeRefCount, parents: &[Parent]) {
         let node_id = *node.as_ref();
 
-        for parent_id in parents.iter() {
-            self.leaves.remove(parent_id);
+        for parent in parents.iter() {
+            self.leaves.remove(&parent.id);
         }
 
         self.leaves.insert(node_id);
-        self.nodes.insert(node, parents);
+        self.nodes.insert(node, parents.to_vec());
     }
 
     /// Free the node from the state.
-    pub fn consume_node(&mut self, node_id: NodeID) {
+    pub fn consume_node(&mut self, node_id: NodeId) {
         if !self.is_referenced(node_id) {
             self.leaves.remove(&node_id);
             self.nodes.remove(&node_id);
@@ -45,7 +55,7 @@ impl GraphMemoryManagement {
     ///
     /// This function goes into three steps, which must happen for all leaves
     /// before going into the next step. Then it deletes what can be safely deleted
-    pub(crate) fn free_unavailable_nodes(&mut self, mut on_free_graph: impl FnMut(&NodeID)) {
+    pub(crate) fn free_unavailable_nodes(&mut self, mut on_free_graph: impl FnMut(&NodeId)) {
         let leaves = self.leaves.clone();
         let mut new_leaves = HashSet::new();
         let mut deletables = Vec::new();
@@ -81,7 +91,17 @@ impl GraphMemoryManagement {
         }
     }
 
-    fn clear_unused_roots(&mut self, to_delete: &mut Vec<NodeID>) {
+    pub(crate) fn free_unused_roots(&mut self, mut on_free_graph: impl FnMut(&NodeId)) {
+        let mut deletables = Vec::new();
+        self.clear_unused_roots(&mut deletables);
+
+        for node_id in deletables {
+            self.nodes.remove(&node_id);
+            on_free_graph(&node_id);
+        }
+    }
+
+    fn clear_unused_roots(&self, to_delete: &mut Vec<NodeId>) {
         for (id, parents) in self.nodes.iter() {
             let is_useful = matches!(
                 self.statuses.get(id.as_ref()),
@@ -89,7 +109,7 @@ impl GraphMemoryManagement {
             );
 
             // Check if parents are either empty or absent from self.nodes
-            let parents_absent = parents.iter().all(|p| !self.nodes.contains_key(p));
+            let parents_absent = parents.iter().all(|p| !self.nodes.contains_key(&p.id));
 
             if !is_useful && Arc::strong_count(id) == 1 && parents_absent {
                 to_delete.push(*id.as_ref())
@@ -97,7 +117,7 @@ impl GraphMemoryManagement {
         }
     }
 
-    fn unavailable_propagation(&mut self, node_id: NodeID) -> NodeMemoryStatus {
+    fn unavailable_propagation(&mut self, node_id: NodeId) -> NodeMemoryStatus {
         // If already visited
         if let Some(status) = self.statuses.get(&node_id) {
             return status.clone();
@@ -110,7 +130,12 @@ impl GraphMemoryManagement {
             Some(parents) => {
                 let mut node_status = NodeMemoryStatus::Unknown;
                 for parent in parents {
-                    let parent_status = self.unavailable_propagation(parent);
+                    // Consuming a leaf's no-op step must not invalidate another branch,
+                    // including when the leaf's tensor handle has already been dropped.
+                    if parent.is_leaf && !self.nodes.contains_key(&parent.id) {
+                        continue;
+                    }
+                    let parent_status = self.unavailable_propagation(parent.id);
                     if let NodeMemoryStatus::Unavailable = parent_status {
                         node_status = NodeMemoryStatus::Unavailable;
                     }
@@ -127,7 +152,7 @@ impl GraphMemoryManagement {
         }
     }
 
-    fn useful_propagation(&mut self, leaves: HashSet<NodeID>) {
+    fn useful_propagation(&mut self, leaves: HashSet<NodeId>) {
         // Accumulate visited nodes
         let mut explored = HashSet::new();
         let mut tagged_useful = HashSet::new();
@@ -136,13 +161,15 @@ impl GraphMemoryManagement {
         let mut to_tag_useful = PopNodeSet::default();
         let mut to_explore = PopNodeSet::new(leaves);
 
-        // Utilitary function to iterate over a node's parents
+        // Utility function to iterate over a node's parents
         let parents = |node_id| {
             self.nodes
                 .get(&node_id)
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
+                .filter(|parent| !parent.is_leaf || self.nodes.contains_key(&parent.id))
+                .map(|parent| parent.id)
         };
 
         loop {
@@ -199,9 +226,9 @@ impl GraphMemoryManagement {
 
     fn identify_leaves_and_deletables(
         &self,
-        leaf_id: NodeID,
-        new_leaves: &mut HashSet<NodeID>,
-        to_delete: &mut Vec<NodeID>,
+        leaf_id: NodeId,
+        new_leaves: &mut HashSet<NodeId>,
+        to_delete: &mut Vec<NodeId>,
     ) {
         let mut visited = HashSet::new();
         let mut to_visit = vec![leaf_id];
@@ -226,6 +253,8 @@ impl GraphMemoryManagement {
                         .cloned()
                         .unwrap_or_default()
                         .into_iter()
+                        .filter(|parent| !parent.is_leaf || self.nodes.contains_key(&parent.id))
+                        .map(|parent| parent.id)
                     {
                         if !visited.contains(&parent) {
                             to_visit.push(parent);
@@ -236,23 +265,27 @@ impl GraphMemoryManagement {
         }
     }
 
-    fn is_referenced(&self, node_id: NodeID) -> bool {
+    fn is_referenced(&self, node_id: NodeId) -> bool {
         match self.nodes.get_key_value(&node_id) {
             Some((key, _value)) => Arc::strong_count(key) > 1,
             None => panic!("Node should be in the nodes map"),
         }
+    }
+
+    pub(crate) fn maybe_useful(&self) -> bool {
+        self.nodes.keys().any(|node| Arc::strong_count(node) > 1)
     }
 }
 
 /// Wrapper over hash set for fast popping of any node
 #[derive(new, Default)]
 struct PopNodeSet {
-    hash_set: HashSet<NodeID>,
+    hash_set: HashSet<NodeId>,
 }
 
 impl PopNodeSet {
     #[inline(always)]
-    fn pop(&mut self) -> Option<NodeID> {
+    fn pop(&mut self) -> Option<NodeId> {
         self.hash_set
             .iter()
             .next()
@@ -261,12 +294,12 @@ impl PopNodeSet {
     }
 
     #[inline(always)]
-    fn contains(&self, node_id: &NodeID) -> bool {
+    fn contains(&self, node_id: &NodeId) -> bool {
         self.hash_set.contains(node_id)
     }
 
     #[inline(always)]
-    fn insert(&mut self, node_id: NodeID) {
+    fn insert(&mut self, node_id: NodeId) {
         self.hash_set.insert(node_id);
     }
 }

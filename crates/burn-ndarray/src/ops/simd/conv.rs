@@ -1,7 +1,6 @@
 use core::{marker::PhantomData, mem::transmute};
 
-use burn_common::{iter_range_par, run_par};
-use burn_tensor::{
+use burn_backend::{
     DType, Element,
     ops::{ConvOptions, conv::calculate_conv_output_size},
 };
@@ -12,7 +11,7 @@ use ndarray::{
 };
 use seq_macro::seq;
 
-use crate::{FloatNdArrayElement, SharedArray, UnsafeSharedRef};
+use crate::{FloatNdArrayElement, SharedArray, UnsafeSharedRef, iter_range_par, run_par};
 
 type Args<E> = (SharedArray<E>, SharedArray<E>, Option<SharedArray<E>>);
 
@@ -73,8 +72,8 @@ fn conv2d<E: VMulAdd + Element, T: Element>(
     let [batch_size, _in_channels, in_height, in_width] = x.shape().try_into().unwrap();
     let [dilate_h, dilate_w] = options.dilation;
     let [stride_h, stride_w] = options.stride;
-    let [pad_h, pad_w] = options.padding;
-    let padded = options.padding != [0, 0];
+    let [pad_h, pad_w] = options.padding_begin();
+    let padded = options.padding_begin() != [0, 0];
     let strided = options.stride != [1, 1] || options.dilation != [1, 1];
     let grouped = options.groups != 1;
 
@@ -101,7 +100,7 @@ fn conv2d<E: VMulAdd + Element, T: Element>(
             let b = k / oc_blocks;
             let ob = k % oc_blocks;
             let x = x.slice(s![b, .., .., ..]);
-            let out = unsafe_shared_out.get();
+            let mut out = unsafe_shared_out.get();
             let mut out = out.slice_mut(s![b, .., .., ..]);
             let w = weights.view();
 
@@ -175,7 +174,7 @@ unsafe fn conv2d_launch<
     let channels_per_group = out_channels / options.groups;
     let lanes = E::lanes::<S>();
 
-    let [mut pad_h, mut pad_w] = options.padding;
+    let [mut pad_h, mut pad_w] = options.padding_begin();
     let [stride_h, stride_w] = options.stride;
     let [dilate_h, dilate_w] = options.dilation;
 
@@ -188,9 +187,9 @@ unsafe fn conv2d_launch<
     let oc_b = channels_per_group.min(lanes);
     let ow_b = REGISTER_BLOCK;
 
-    let ow_start = pad_w;
+    let ow_start = pad_w.min(out_width);
     let ow_width = out_width.saturating_sub(2 * pad_w);
-    let oh_start = pad_h;
+    let oh_start = pad_h.min(out_height);
     let oh_end = out_height.saturating_sub(pad_h);
 
     let ow_blocks = ow_width / ow_b;
@@ -274,9 +273,9 @@ unsafe fn conv2d_remainder<S: Simd, E: VMulAdd>(
     let in_channels = weights.shape()[0];
     let (_, in_height, in_width) = x.dim();
     let (out_height, out_width, _) = out.dim();
-    let oh_start = pad_h;
+    let oh_start = pad_h.min(out_height);
     let oh_end = out_height.saturating_sub(pad_h);
-    let ow_start = pad_w;
+    let ow_start = pad_w.min(out_width);
 
     let height1 = in_height + pad_h;
     let width1 = in_width + pad_w;
@@ -309,7 +308,7 @@ unsafe fn conv2d_remainder<S: Simd, E: VMulAdd>(
                         // compiler can't prove this. We can't use `as_slice` with fixed bounds
                         // because we want to support arbitrary input layouts. So an unchecked load
                         // is used.
-                        let i0 = unsafe { x.uget([ic, ih, iw]) }.splat::<S>();
+                        let i0 = unsafe { x.uget([ic_off + ic, ih, iw]) }.splat::<S>();
                         acc = i0.mul_add(f0, acc);
                     }
                 }

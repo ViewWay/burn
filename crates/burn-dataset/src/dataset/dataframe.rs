@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 
 use crate::Dataset;
 
-use polars::frame::row::Row;
-use polars::prelude::*;
+use polars_core::frame::row::Row;
+use polars_core::prelude::*;
 use serde::de::DeserializeSeed;
 use serde::{
     Deserialize,
@@ -58,10 +58,10 @@ where
             .map(|name| {
                 df.schema()
                     .try_get_full(name)
-                    .expect("Corresponding column should exist in the DataFrame")
-                    .0
+                    .map(|(index, _, _)| index)
+                    .map_err(|err| DataframeDatasetError::Other(err.to_string()))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(DataframeDataset {
             df,
@@ -72,7 +72,7 @@ where
     }
 }
 
-impl<I> Dataset<I> for DataframeDataset<I>
+impl<I> Dataset<I, DataframeDatasetError> for DataframeDataset<I>
 where
     I: Clone + Send + Sync + DeserializeOwned,
 {
@@ -82,14 +82,24 @@ where
     ///
     /// * `index` - The index of the item to retrieve
     ///
-    /// # Returns
+    /// # Panics
     ///
-    /// An Option containing the item if it exists, or None if it doesn't
-    fn get(&self, index: usize) -> Option<I> {
-        let row = self.df.get_row(index).ok()?;
+    /// Panics if `index >= len()`.
+    fn get(&self, index: usize) -> Result<I, DataframeDatasetError> {
+        assert!(
+            index < self.len,
+            "Index out of bounds for DataframeDataset: {} >= {}",
+            index,
+            self.len,
+        );
+
+        let row = self
+            .df
+            .get_row(index)
+            .map_err(|err| DataframeDatasetError::Other(err.to_string()))?;
 
         let mut deserializer = RowDeserializer::new(&row, &self.column_name_mapping);
-        I::deserialize(&mut deserializer).ok()
+        I::deserialize(&mut deserializer)
     }
 
     /// Get the length of the dataset
@@ -200,6 +210,40 @@ impl<'de, 'a> SeqAccess<'de> for RowDeserializer<'a> {
     }
 }
 
+struct FieldExtractor {
+    fields: Vec<&'static str>,
+}
+
+impl<'de> Deserializer<'de> for &mut FieldExtractor {
+    type Error = de::value::Error;
+
+    fn deserialize_any<V>(self, _visitor: V) -> core::result::Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        Err(de::Error::custom("Field extractor"))
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        _visitor: V,
+    ) -> core::result::Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.fields.extend_from_slice(fields);
+        Err(de::Error::custom("Field extractor"))
+    }
+
+    forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes
+        byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map enum identifier ignored_any
+    }
+}
+
 /// Extract field names from a type T that implements Deserialize
 ///
 /// # Returns
@@ -209,40 +253,6 @@ fn extract_field_names<'de, T>() -> Vec<&'static str>
 where
     T: Deserialize<'de>,
 {
-    struct FieldExtractor {
-        fields: Vec<&'static str>,
-    }
-
-    impl<'de> Deserializer<'de> for &mut FieldExtractor {
-        type Error = de::value::Error;
-
-        fn deserialize_any<V>(self, _visitor: V) -> core::result::Result<V::Value, Self::Error>
-        where
-            V: Visitor<'de>,
-        {
-            Err(de::Error::custom("Field extractor"))
-        }
-
-        fn deserialize_struct<V>(
-            self,
-            _name: &'static str,
-            fields: &'static [&'static str],
-            _visitor: V,
-        ) -> core::result::Result<V::Value, Self::Error>
-        where
-            V: Visitor<'de>,
-        {
-            self.fields.extend_from_slice(fields);
-            Err(de::Error::custom("Field extractor"))
-        }
-
-        forward_to_deserialize_any! {
-            bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes
-            byte_buf option unit unit_struct newtype_struct seq tuple
-            tuple_struct map enum identifier ignored_any
-        }
-    }
-
     let mut extractor = FieldExtractor { fields: Vec::new() };
     let _ = T::deserialize(&mut extractor);
     extractor.fields
@@ -250,7 +260,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use polars::prelude::*;
     use serde::Deserialize;
 
     use super::*;
@@ -284,7 +293,7 @@ mod tests {
         let binary_data: Vec<&[u8]> = vec![&[1, 2, 3], &[4, 5, 6], &[7, 8, 9]];
 
         let s13 = Column::new("binary".into(), binary_data);
-        DataFrame::new(vec![s0, s1, s2, s3, s6, s8, s9, s10, s11, s12, s13]).unwrap()
+        DataFrame::new_infer_height(vec![s0, s1, s2, s3, s6, s8, s9, s10, s11, s12, s13]).unwrap()
     }
 
     #[test]
@@ -307,7 +316,7 @@ mod tests {
         let df = create_test_dataframe();
         let dataset = DataframeDataset::<TestData>::new(df).unwrap();
 
-        let expected_items = vec![
+        let expected_items = [
             TestData {
                 int32: 1,
                 bool: true,
@@ -356,10 +365,45 @@ mod tests {
     }
 
     #[test]
+    fn test_dataframe_dataset_temporal_and_unsigned_columns() {
+        #[derive(Clone, Debug, Deserialize, PartialEq)]
+        struct Item {
+            uint8: u8,
+            uint16: u16,
+            date: i32,
+            time: i64,
+        }
+
+        let df = DataFrame::new_infer_height(vec![
+            Column::new("uint8".into(), [u8::MAX]),
+            Column::new("uint16".into(), [u16::MAX]),
+            Column::new("date".into(), [-1i32])
+                .cast(&DataType::Date)
+                .unwrap(),
+            Column::new("time".into(), [1_234_567_890i64])
+                .cast(&DataType::Time)
+                .unwrap(),
+        ])
+        .unwrap();
+
+        let dataset = DataframeDataset::<Item>::new(df).unwrap();
+        assert_eq!(
+            dataset.get(0).unwrap(),
+            Item {
+                uint8: u8::MAX,
+                uint16: u16::MAX,
+                date: -1,
+                time: 1_234_567_890,
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Index out of bounds")]
     fn test_dataframe_dataset_out_of_bounds() {
         let df = create_test_dataframe();
         let dataset = DataframeDataset::<TestData>::new(df).unwrap();
-        assert!(dataset.get(3).is_none());
+        dataset.get(3).unwrap();
     }
 
     #[test]
@@ -409,7 +453,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic = "Corresponding column should exist in the DataFrame: SchemaFieldNotFound(ErrString(\"non_existent\"))"]
     fn test_non_existing_struct_fields() {
         #[derive(Clone, Debug, Deserialize, PartialEq)]
         struct PartialTestData {

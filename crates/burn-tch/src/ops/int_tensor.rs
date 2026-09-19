@@ -1,20 +1,25 @@
 use std::ops::Range;
 
-use burn_tensor::{
-    Distribution, IntDType, Shape, TensorData, TensorMetadata,
-    backend::Backend,
-    ops::{FloatTensorOps, IntTensor, IntTensorOps},
+use burn_backend::{
+    BoolDType, Distribution, ExecutionError, FloatDType, IntDType, Scalar, Shape, TensorData,
+    TensorMetadata,
+    ops::{FloatTensorOps, IntTensorOps},
+    tensor::IntTensor,
 };
 
-use crate::{IntoKind, LibTorch, LibTorchDevice, TchShape, TchTensor, element::TchElement};
+use crate::{IntoKind, LibTorch, LibTorchDevice, TchShape, TchTensor};
 
 use super::TchOps;
 
-impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
+impl IntTensorOps<Self> for LibTorch {
     fn int_from_data(data: TensorData, device: &LibTorchDevice) -> TchTensor {
         match data.dtype {
-            burn_tensor::DType::I64 => TchTensor::from_data::<i64>(data, (*device).into()),
-            _ => unimplemented!("Unsupported dtype for `int_from_data`"),
+            burn_backend::DType::I64 => TchTensor::from_data::<i64>(data, (*device).into()),
+            burn_backend::DType::I32 => TchTensor::from_data::<i32>(data, (*device).into()),
+            burn_backend::DType::I16 => TchTensor::from_data::<i16>(data, (*device).into()),
+            burn_backend::DType::I8 => TchTensor::from_data::<i8>(data, (*device).into()),
+            burn_backend::DType::U8 => TchTensor::from_data::<u8>(data, (*device).into()),
+            _ => unimplemented!("Unsupported dtype for `int_from_data`: {:?}", data.dtype),
         }
     }
 
@@ -22,11 +27,11 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchOps::repeat_dim(tensor, dim, times)
     }
 
-    async fn int_into_data(tensor: TchTensor) -> TensorData {
+    async fn int_into_data(tensor: TchTensor) -> Result<TensorData, ExecutionError> {
         let shape = tensor.shape();
         let tensor = Self::int_reshape(tensor.clone(), Shape::new([shape.num_elements()]));
         let values: Result<Vec<i64>, tch::TchError> = tensor.tensor.shallow_clone().try_into();
-        TensorData::new(values.unwrap(), shape)
+        Ok(TensorData::new(values.unwrap(), shape))
     }
 
     fn int_to_device(tensor: TchTensor, device: &LibTorchDevice) -> TchTensor {
@@ -37,15 +42,7 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchOps::reshape(tensor, shape)
     }
 
-    fn int_device(tensor: &TchTensor) -> LibTorchDevice {
-        tensor.tensor.device().into()
-    }
-
-    fn int_empty(
-        shape: Shape,
-        device: &<LibTorch<E> as Backend>::Device,
-        dtype: IntDType,
-    ) -> TchTensor {
+    fn int_empty(shape: Shape, device: &LibTorchDevice, dtype: IntDType) -> TchTensor {
         let tensor = tch::Tensor::empty(
             TchShape::from(shape).dims,
             (dtype.into_kind(), (*device).into()),
@@ -54,12 +51,16 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchTensor::new(tensor)
     }
 
-    fn int_slice(tensor: TchTensor, ranges: &[Range<usize>]) -> TchTensor {
-        TchOps::slice(tensor, ranges)
+    fn int_slice(tensor: TchTensor, slices: &[burn_backend::Slice]) -> TchTensor {
+        TchOps::slice_with_steps(tensor, slices)
     }
 
-    fn int_slice_assign(tensor: TchTensor, ranges: &[Range<usize>], value: TchTensor) -> TchTensor {
-        TchOps::slice_assign(tensor, ranges, value)
+    fn int_slice_assign(
+        tensor: TchTensor,
+        slices: &[burn_backend::Slice],
+        value: TchTensor,
+    ) -> TchTensor {
+        TchOps::slice_assign(tensor, slices, value)
     }
 
     fn int_cat(tensors: Vec<TchTensor>, dim: usize) -> TchTensor {
@@ -67,60 +68,61 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
     }
 
     fn int_matmul(lhs: IntTensor<Self>, rhs: IntTensor<Self>) -> IntTensor<Self> {
-        let lhs = Self::int_into_float(lhs);
-        let rhs = Self::int_into_float(rhs);
+        let int_dtype = lhs.dtype();
+        let lhs = Self::int_into_float(lhs, FloatDType::F32);
+        let rhs = Self::int_into_float(rhs, FloatDType::F32);
         let out = lhs.tensor.f_matmul(&rhs.tensor).unwrap();
-        Self::float_into_int(TchTensor::new(out))
+        Self::float_into_int(TchTensor::new(out), int_dtype.into())
     }
 
-    fn int_equal(lhs: TchTensor, rhs: TchTensor) -> TchTensor {
+    fn int_equal(lhs: TchTensor, rhs: TchTensor, _out_dtype: BoolDType) -> TchTensor {
         TchOps::equal(lhs, rhs)
     }
 
-    fn int_equal_elem(lhs: TchTensor, rhs: i64) -> TchTensor {
-        TchOps::equal_elem(lhs, rhs)
+    fn int_equal_elem(lhs: TchTensor, rhs: Scalar, _out_dtype: BoolDType) -> TchTensor {
+        TchOps::equal_elem(lhs, rhs.elem::<i64>())
     }
 
-    fn int_greater(lhs: TchTensor, rhs: TchTensor) -> TchTensor {
+    fn int_greater(lhs: TchTensor, rhs: TchTensor, _out_dtype: BoolDType) -> TchTensor {
         TchOps::greater(lhs, rhs)
     }
 
-    fn int_greater_elem(lhs: TchTensor, rhs: i64) -> TchTensor {
-        TchOps::greater_elem(lhs, rhs)
+    fn int_greater_elem(lhs: TchTensor, rhs: Scalar, _out_dtype: BoolDType) -> TchTensor {
+        TchOps::greater_elem(lhs, rhs.elem::<i64>())
     }
 
-    fn int_greater_equal(lhs: TchTensor, rhs: TchTensor) -> TchTensor {
+    fn int_greater_equal(lhs: TchTensor, rhs: TchTensor, _out_dtype: BoolDType) -> TchTensor {
         TchOps::greater_equal(lhs, rhs)
     }
 
-    fn int_greater_equal_elem(lhs: TchTensor, rhs: i64) -> TchTensor {
-        TchOps::greater_equal_elem(lhs, rhs)
+    fn int_greater_equal_elem(lhs: TchTensor, rhs: Scalar, _out_dtype: BoolDType) -> TchTensor {
+        TchOps::greater_equal_elem(lhs, rhs.elem::<i64>())
     }
 
-    fn int_lower(lhs: TchTensor, rhs: TchTensor) -> TchTensor {
+    fn int_lower(lhs: TchTensor, rhs: TchTensor, _out_dtype: BoolDType) -> TchTensor {
         TchOps::lower(lhs, rhs)
     }
 
-    fn int_lower_elem(lhs: TchTensor, rhs: i64) -> TchTensor {
-        TchOps::lower_elem(lhs, rhs)
+    fn int_lower_elem(lhs: TchTensor, rhs: Scalar, _out_dtype: BoolDType) -> TchTensor {
+        TchOps::lower_elem(lhs, rhs.elem::<i64>())
     }
 
-    fn int_lower_equal(lhs: TchTensor, rhs: TchTensor) -> TchTensor {
+    fn int_lower_equal(lhs: TchTensor, rhs: TchTensor, _out_dtype: BoolDType) -> TchTensor {
         TchOps::lower_equal(lhs, rhs)
     }
 
-    fn int_lower_equal_elem(lhs: TchTensor, rhs: i64) -> TchTensor {
-        TchOps::lower_equal_elem(lhs, rhs)
+    fn int_lower_equal_elem(lhs: TchTensor, rhs: Scalar, _out_dtype: BoolDType) -> TchTensor {
+        TchOps::lower_equal_elem(lhs, rhs.elem::<i64>())
     }
 
     fn int_add(lhs: TchTensor, rhs: TchTensor) -> TchTensor {
         TchOps::add(lhs, rhs)
     }
 
-    fn int_add_scalar(lhs: TchTensor, rhs: i64) -> TchTensor {
+    fn int_add_scalar(lhs: TchTensor, rhs: Scalar) -> TchTensor {
         lhs.unary_ops(
-            |mut tensor| tensor.f_add_scalar_(rhs).unwrap(),
-            |tensor| tensor.f_add_scalar(rhs).unwrap(),
+            |mut tensor| tensor.f_add_scalar_(rhs.elem::<i64>()).unwrap(),
+            |tensor| tensor.f_add_scalar(rhs.elem::<i64>()).unwrap(),
         )
     }
 
@@ -128,10 +130,10 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchOps::sub(lhs, rhs)
     }
 
-    fn int_sub_scalar(lhs: TchTensor, rhs: i64) -> TchTensor {
+    fn int_sub_scalar(lhs: TchTensor, rhs: Scalar) -> TchTensor {
         lhs.unary_ops(
-            |mut tensor| tensor.f_sub_scalar_(rhs).unwrap(),
-            |tensor| tensor.f_sub_scalar(rhs).unwrap(),
+            |mut tensor| tensor.f_sub_scalar_(rhs.elem::<i64>()).unwrap(),
+            |tensor| tensor.f_sub_scalar(rhs.elem::<i64>()).unwrap(),
         )
     }
 
@@ -139,10 +141,10 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchOps::mul(lhs, rhs)
     }
 
-    fn int_mul_scalar(lhs: TchTensor, rhs: i64) -> TchTensor {
+    fn int_mul_scalar(lhs: TchTensor, rhs: Scalar) -> TchTensor {
         lhs.unary_ops(
-            |mut tensor| tensor.f_mul_scalar_(rhs).unwrap(),
-            |tensor| tensor.f_mul_scalar(rhs).unwrap(),
+            |mut tensor| tensor.f_mul_scalar_(rhs.elem::<i64>()).unwrap(),
+            |tensor| tensor.f_mul_scalar(rhs.elem::<i64>()).unwrap(),
         )
     }
 
@@ -160,7 +162,7 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchTensor::new(out.tensor.to_dtype(dtype, non_blocking, copy))
     }
 
-    fn int_div_scalar(lhs: TchTensor, rhs: i64) -> TchTensor {
+    fn int_div_scalar(lhs: TchTensor, rhs: Scalar) -> TchTensor {
         let dtype = lhs.tensor.kind();
         let copy = false;
         let non_blocking = true;
@@ -168,8 +170,8 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
             TchTensor::new(lhs.tensor.to_dtype(tch::Kind::Float, non_blocking, copy));
 
         let out: TchTensor = lhs.unary_ops(
-            |mut tensor| tensor.f_div_scalar_(rhs).unwrap(),
-            |tensor| tensor.f_div_scalar(rhs).unwrap(),
+            |mut tensor| tensor.f_div_scalar_(rhs.elem::<i64>()).unwrap(),
+            |tensor| tensor.f_div_scalar(rhs.elem::<i64>()).unwrap(),
         );
 
         TchTensor::new(out.tensor.to_dtype(dtype, non_blocking, copy))
@@ -189,33 +191,21 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchTensor::new(out.tensor.to_dtype(dtype, non_blocking, copy))
     }
 
-    fn int_remainder_scalar(lhs: TchTensor, rhs: i64) -> TchTensor {
+    fn int_remainder_scalar(lhs: TchTensor, rhs: Scalar) -> TchTensor {
         lhs.unary_ops(
-            |tensor| tensor.f_remainder(rhs).unwrap(),
-            |tensor| tensor.f_remainder(rhs).unwrap(),
+            |tensor| tensor.f_remainder(rhs.elem::<i64>()).unwrap(),
+            |tensor| tensor.f_remainder(rhs.elem::<i64>()).unwrap(),
         )
     }
 
-    fn int_neg(tensor: TchTensor) -> TchTensor {
-        Self::int_mul_scalar(tensor, -1)
-    }
-
-    fn int_zeros(
-        shape: Shape,
-        device: &<LibTorch<E> as Backend>::Device,
-        dtype: IntDType,
-    ) -> TchTensor {
+    fn int_zeros(shape: Shape, device: &LibTorchDevice, dtype: IntDType) -> TchTensor {
         let shape = TchShape::from(shape);
         let device: tch::Device = (*device).into();
 
         TchTensor::new(tch::Tensor::zeros(shape.dims, (dtype.into_kind(), device)))
     }
 
-    fn int_ones(
-        shape: Shape,
-        device: &<LibTorch<E> as Backend>::Device,
-        dtype: IntDType,
-    ) -> TchTensor {
+    fn int_ones(shape: Shape, device: &LibTorchDevice, dtype: IntDType) -> TchTensor {
         let shape = TchShape::from(shape);
         let device: tch::Device = (*device).into();
 
@@ -224,8 +214,8 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
 
     fn int_full(
         shape: Shape,
-        fill_value: i64,
-        device: &<LibTorch<E> as Backend>::Device,
+        fill_value: Scalar,
+        device: &LibTorchDevice,
         dtype: IntDType,
     ) -> TchTensor {
         let shape = TchShape::from(shape);
@@ -233,7 +223,7 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
 
         TchTensor::new(tch::Tensor::full(
             shape.dims,
-            fill_value,
+            fill_value.elem::<i64>(),
             (dtype.into_kind(), device),
         ))
     }
@@ -273,6 +263,22 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchTensor::new(output.tensor.to_dtype(dtype, true, false))
     }
 
+    fn int_cumsum(tensor: TchTensor, dim: usize) -> TchTensor {
+        TchOps::cumsum(tensor, dim)
+    }
+
+    fn int_cumprod(tensor: TchTensor, dim: usize) -> TchTensor {
+        TchOps::cumprod(tensor, dim)
+    }
+
+    fn int_cummin(tensor: TchTensor, dim: usize) -> TchTensor {
+        TchOps::cummin(tensor, dim)
+    }
+
+    fn int_cummax(tensor: TchTensor, dim: usize) -> TchTensor {
+        TchOps::cummax(tensor, dim)
+    }
+
     fn int_gather(dim: usize, tensor: TchTensor, indices: TchTensor) -> TchTensor {
         TchOps::gather(dim, tensor, indices)
     }
@@ -282,8 +288,38 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         tensor: TchTensor,
         indices: TchTensor,
         value: TchTensor,
+        update: burn_backend::tensor::IndexingUpdateOp,
     ) -> TchTensor {
-        TchOps::scatter(dim, tensor, indices, value)
+        match update {
+            burn_backend::tensor::IndexingUpdateOp::Assign => {
+                TchOps::scatter_assign(dim, tensor, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Add => {
+                TchOps::scatter(dim, tensor, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Mul => {
+                TchOps::scatter_mul(dim, tensor, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Min => {
+                TchOps::scatter_min(dim, tensor, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Max => {
+                TchOps::scatter_max(dim, tensor, indices, value)
+            }
+        }
+    }
+
+    fn int_scatter_nd(
+        data: TchTensor,
+        indices: TchTensor,
+        values: TchTensor,
+        reduction: burn_backend::tensor::IndexingUpdateOp,
+    ) -> TchTensor {
+        TchOps::scatter_nd(data, indices, values, reduction)
+    }
+
+    fn int_gather_nd(data: TchTensor, indices: TchTensor) -> TchTensor {
+        TchOps::gather_nd(data, indices)
     }
 
     fn int_select(tensor: TchTensor, dim: usize, indices: TchTensor) -> TchTensor {
@@ -295,8 +331,25 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         dim: usize,
         indices: TchTensor,
         value: TchTensor,
+        update: burn_backend::tensor::IndexingUpdateOp,
     ) -> TchTensor {
-        TchOps::select_assign(tensor, dim, indices, value)
+        match update {
+            burn_backend::tensor::IndexingUpdateOp::Assign => {
+                TchOps::select_assign_replace(tensor, dim, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Add => {
+                TchOps::select_assign(tensor, dim, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Mul => {
+                TchOps::select_assign_mul(tensor, dim, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Min => {
+                TchOps::select_assign_min(tensor, dim, indices, value)
+            }
+            burn_backend::tensor::IndexingUpdateOp::Max => {
+                TchOps::select_assign_max(tensor, dim, indices, value)
+            }
+        }
     }
 
     fn int_mask_where(tensor: TchTensor, mask: TchTensor, source: TchTensor) -> TchTensor {
@@ -309,15 +362,28 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         )
     }
 
-    fn int_mask_fill(tensor: TchTensor, mask: TchTensor, value: i64) -> TchTensor {
+    fn int_mask_fill(tensor: TchTensor, mask: TchTensor, value: Scalar) -> TchTensor {
+        let value = value.elem::<i64>();
         tensor.unary_ops(
             |mut tensor| tensor.f_masked_fill_(&mask.tensor, value).unwrap(),
             |tensor| tensor.f_masked_fill(&mask.tensor, value).unwrap(),
         )
     }
 
+    async fn int_mask_select(tensor: TchTensor, mask: TchTensor) -> TchTensor {
+        TchTensor::new(tensor.tensor.masked_select(&mask.tensor))
+    }
+
     fn int_argmax(tensor: TchTensor, dim: usize) -> TchTensor {
         TchOps::argmax(tensor, dim)
+    }
+
+    fn int_argtopk(tensor: TchTensor, dim: usize, k: usize) -> TchTensor {
+        TchOps::argtopk(tensor, dim, k)
+    }
+
+    fn int_topk(tensor: TchTensor, dim: usize, k: usize) -> TchTensor {
+        TchOps::topk(tensor, dim, k)
     }
 
     fn int_argmin(tensor: TchTensor, dim: usize) -> TchTensor {
@@ -340,24 +406,24 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchOps::min_dim_with_indices(tensor, dim)
     }
 
-    fn int_clamp_min(tensor: TchTensor, min: i64) -> TchTensor {
-        TchOps::clamp_min(tensor, min)
+    fn int_clamp_min(tensor: TchTensor, min: Scalar) -> TchTensor {
+        TchOps::clamp_min(tensor, min.elem::<i64>())
     }
 
-    fn int_clamp_max(tensor: TchTensor, max: i64) -> TchTensor {
-        TchOps::clamp_max(tensor, max)
+    fn int_clamp_max(tensor: TchTensor, max: Scalar) -> TchTensor {
+        TchOps::clamp_max(tensor, max.elem::<i64>())
     }
 
-    fn int_clamp(tensor: TchTensor, min: i64, max: i64) -> TchTensor {
-        TchOps::clamp(tensor, min, max)
+    fn int_clamp(tensor: TchTensor, min: Scalar, max: Scalar) -> TchTensor {
+        TchOps::clamp(tensor, min.elem::<i64>(), max.elem::<i64>())
     }
 
     fn int_abs(tensor: TchTensor) -> TchTensor {
         tensor.unary_ops(|mut tensor| tensor.abs_(), |tensor| tensor.abs())
     }
 
-    fn int_into_float(tensor: TchTensor) -> TchTensor {
-        let tensor = tensor.tensor.to_kind(E::KIND);
+    fn int_into_float(tensor: TchTensor, out_dtype: FloatDType) -> TchTensor {
+        let tensor = tensor.tensor.to_kind(out_dtype.into_kind());
         TchTensor::new(tensor)
     }
 
@@ -365,16 +431,21 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchOps::swap_dims(tensor, dim1, dim2)
     }
 
-    fn int_random(shape: Shape, distribution: Distribution, device: &LibTorchDevice) -> TchTensor {
+    fn int_random(
+        shape: Shape,
+        distribution: Distribution,
+        device: &LibTorchDevice,
+        dtype: IntDType,
+    ) -> TchTensor {
         match distribution {
             Distribution::Default => TchTensor::new(tch::Tensor::randint_low(
                 0,
                 255,
-                shape.dims.into_iter().map(|i| i as i64).collect::<Vec<_>>(),
-                (tch::Kind::Int64, (*device).into()),
+                shape.iter().map(|i| *i as i64).collect::<Vec<_>>(),
+                (dtype.into_kind(), (*device).into()),
             )),
             Distribution::Bernoulli(prob) => {
-                let mut tensor = TchTensor::empty::<i64>(shape, *device);
+                let mut tensor = TchTensor::empty(shape, *device, dtype.into());
                 tensor
                     .mut_ops(|tensor| tensor.f_bernoulli_float_(prob).unwrap())
                     .unwrap()
@@ -382,19 +453,19 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
             Distribution::Uniform(from, to) => TchTensor::new(tch::Tensor::randint_low(
                 from as i64,
                 to as i64,
-                shape.dims.into_iter().map(|i| i as i64).collect::<Vec<_>>(),
-                (tch::Kind::Int64, (*device).into()),
+                shape.iter().map(|i| *i as i64).collect::<Vec<_>>(),
+                (dtype.into_kind(), (*device).into()),
             )),
             Distribution::Normal(mean, std) => {
-                let mut tensor = TchTensor::empty::<i64>(shape, *device);
+                let mut tensor = TchTensor::empty(shape, *device, dtype.into());
                 tensor.mut_ops(|tensor| tensor.normal_(mean, std)).unwrap()
             }
         }
     }
 
-    fn int_arange(range: Range<i64>, device: &LibTorchDevice) -> TchTensor {
+    fn int_arange(range: Range<i64>, device: &LibTorchDevice, dtype: IntDType) -> TchTensor {
         let device: tch::Device = (*device).into();
-        let mut tensor = tch::Tensor::arange(range.end - range.start, (tch::Kind::Int64, device));
+        let mut tensor = tch::Tensor::arange(range.end - range.start, (dtype.into_kind(), device));
 
         if range.start != 0 {
             tensor = tensor.f_add_scalar_(range.start).unwrap();
@@ -443,25 +514,16 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchOps::bitwise_not(tensor)
     }
 
-    fn bitwise_and_scalar(
-        lhs: IntTensor<Self>,
-        rhs: burn_tensor::ops::IntElem<Self>,
-    ) -> IntTensor<Self> {
-        TchOps::bitwise_and_scalar(lhs, rhs)
+    fn bitwise_and_scalar(lhs: IntTensor<Self>, rhs: Scalar) -> IntTensor<Self> {
+        TchOps::bitwise_and_scalar(lhs, rhs.elem::<i64>())
     }
 
-    fn bitwise_or_scalar(
-        lhs: IntTensor<Self>,
-        rhs: burn_tensor::ops::IntElem<Self>,
-    ) -> IntTensor<Self> {
-        TchOps::bitwise_or_scalar(lhs, rhs)
+    fn bitwise_or_scalar(lhs: IntTensor<Self>, rhs: Scalar) -> IntTensor<Self> {
+        TchOps::bitwise_or_scalar(lhs, rhs.elem::<i64>())
     }
 
-    fn bitwise_xor_scalar(
-        lhs: IntTensor<Self>,
-        rhs: burn_tensor::ops::IntElem<Self>,
-    ) -> IntTensor<Self> {
-        TchOps::bitwise_xor_scalar(lhs, rhs)
+    fn bitwise_xor_scalar(lhs: IntTensor<Self>, rhs: Scalar) -> IntTensor<Self> {
+        TchOps::bitwise_xor_scalar(lhs, rhs.elem::<i64>())
     }
 
     fn bitwise_left_shift(lhs: IntTensor<Self>, rhs: IntTensor<Self>) -> IntTensor<Self> {
@@ -472,18 +534,12 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         TchOps::bitwise_right_shift(lhs, rhs)
     }
 
-    fn bitwise_left_shift_scalar(
-        lhs: IntTensor<Self>,
-        rhs: burn_tensor::ops::IntElem<Self>,
-    ) -> IntTensor<Self> {
-        TchOps::bitwise_left_shift_scalar(lhs, rhs)
+    fn bitwise_left_shift_scalar(lhs: IntTensor<Self>, rhs: Scalar) -> IntTensor<Self> {
+        TchOps::bitwise_left_shift_scalar(lhs, rhs.elem::<i64>())
     }
 
-    fn bitwise_right_shift_scalar(
-        lhs: IntTensor<Self>,
-        rhs: burn_tensor::ops::IntElem<Self>,
-    ) -> IntTensor<Self> {
-        TchOps::bitwise_right_shift_scalar(lhs, rhs)
+    fn bitwise_right_shift_scalar(lhs: IntTensor<Self>, rhs: Scalar) -> IntTensor<Self> {
+        TchOps::bitwise_right_shift_scalar(lhs, rhs.elem::<i64>())
     }
 
     fn int_cast(tensor: IntTensor<Self>, dtype: IntDType) -> IntTensor<Self> {
@@ -498,5 +554,25 @@ impl<E: TchElement> IntTensorOps<Self> for LibTorch<E> {
         } else {
             TchTensor::new(tensor.tensor.to_kind(kind))
         }
+    }
+
+    fn int_unfold(
+        tensor: IntTensor<Self>,
+        dim: usize,
+        size: usize,
+        step: usize,
+    ) -> IntTensor<Self> {
+        TchOps::unfold(tensor, dim, size, step)
+    }
+
+    fn int_powi(lhs: IntTensor<Self>, rhs: IntTensor<Self>) -> IntTensor<Self> {
+        TchOps::pow(lhs, rhs)
+    }
+
+    fn int_powi_scalar_impl(lhs: IntTensor<Self>, rhs: Scalar) -> IntTensor<Self> {
+        lhs.unary_ops(
+            |mut tensor| tensor.f_pow_(rhs.elem::<i64>()).unwrap(),
+            |tensor| tensor.pow_tensor_scalar(rhs.elem::<i64>()),
+        )
     }
 }

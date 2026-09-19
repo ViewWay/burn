@@ -1,8 +1,6 @@
-use std::marker::PhantomData;
-
-use burn_communication::ProtocolClient;
+use burn_backend::Shape;
 use burn_ir::TensorIr;
-use burn_router::{RouterTensor, RunnerChannel, get_client};
+use burn_router::{RouterChannel, RouterTensor, get_client};
 
 use super::{
     RemoteClient,
@@ -10,42 +8,33 @@ use super::{
 };
 
 /// A local channel with direct connection to the backend runner clients.
-pub struct RemoteChannel<C: ProtocolClient> {
-    _p: PhantomData<C>,
-}
+pub struct RemoteChannel;
 
-impl<C: ProtocolClient> RunnerChannel for RemoteChannel<C> {
+impl RouterChannel for RemoteChannel {
     type Device = RemoteDevice;
-    type Bridge = RemoteBridge<C>;
+    type Bridge = RemoteBridge;
     type Client = RemoteClient;
-
-    type FloatElem = f32;
-
-    type IntElem = i32;
-
-    type BoolElem = u32;
 
     fn name(device: &Self::Device) -> String {
         format!("remote-{device:?}")
     }
 
     fn init_client(device: &Self::Device) -> Self::Client {
-        RemoteClient::init::<C>(device.clone())
+        RemoteClient::init(device.clone())
     }
 
-    fn get_tensor_handle(tensor: &TensorIr, client: &Self::Client) -> RemoteTensorHandle<C> {
+    fn get_tensor_handle(tensor: &TensorIr, client: &Self::Client) -> RemoteTensorHandle {
         RemoteTensorHandle {
             client: client.clone(),
             tensor: tensor.clone(),
-            _p: PhantomData,
         }
     }
 
     fn register_tensor(
         _client: &Self::Client,
-        _handle: RemoteTensorHandle<C>,
-        _shape: Vec<usize>,
-        _dtype: burn_tensor::DType,
+        _handle: RemoteTensorHandle,
+        _shape: Shape,
+        _dtype: burn_backend::DType,
     ) -> RouterTensor<Self::Client> {
         // This function is normally only used to move a tensor from a device to another.
         //
@@ -74,8 +63,8 @@ impl<C: ProtocolClient> RunnerChannel for RemoteChannel<C> {
     }
 }
 
-impl<C: ProtocolClient> Clone for RemoteChannel<C> {
+impl Clone for RemoteChannel {
     fn clone(&self) -> Self {
-        RemoteChannel { _p: PhantomData }
+        RemoteChannel
     }
 }

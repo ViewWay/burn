@@ -1,34 +1,28 @@
-use crate::metric::MetricName;
+use crate::metric::{MetricName, Numeric, state::ConfusionStatsState};
 
 use super::{
-    Metric, MetricEntry, MetricMetadata, Numeric,
+    Metric, MetricAttributes, MetricMetadata, NumericAttributes, NumericEntry, SerializedEntry,
     classification::{ClassReduction, ClassificationMetricConfig, DecisionRule},
     confusion_stats::{ConfusionStats, ConfusionStatsInput},
-    state::{FormatOptions, NumericMetricState},
+    state::FormatOptions,
 };
-use burn_core::{
-    prelude::{Backend, Tensor},
-    tensor::cast::ToElement,
-};
-use core::marker::PhantomData;
 use std::{num::NonZeroUsize, sync::Arc};
 
 /// The Precision Metric
 #[derive(Clone)]
-pub struct PrecisionMetric<B: Backend> {
+pub struct PrecisionMetric {
     name: MetricName,
-    state: NumericMetricState,
-    _b: PhantomData<B>,
+    state: ConfusionStatsState,
     config: ClassificationMetricConfig,
 }
 
-impl<B: Backend> Default for PrecisionMetric<B> {
+impl Default for PrecisionMetric {
     fn default() -> Self {
         Self::new(Default::default())
     }
 }
 
-impl<B: Backend> PrecisionMetric<B> {
+impl PrecisionMetric {
     fn new(config: ClassificationMetricConfig) -> Self {
         let state = Default::default();
         let name = Arc::new(format!(
@@ -40,7 +34,6 @@ impl<B: Backend> PrecisionMetric<B> {
             state,
             config,
             name,
-            _b: Default::default(),
         }
     }
     /// Precision metric for binary classification.
@@ -89,46 +82,37 @@ impl<B: Backend> PrecisionMetric<B> {
             ..Default::default()
         }
     }
-
-    fn class_average(&self, mut aggregated_metric: Tensor<B, 1>) -> f64 {
-        use ClassReduction::{Macro, Micro};
-        let avg_tensor = match self.config.class_reduction {
-            Micro => aggregated_metric,
-            Macro => {
-                if aggregated_metric
-                    .clone()
-                    .contains_nan()
-                    .any()
-                    .into_scalar()
-                    .to_bool()
-                {
-                    let nan_mask = aggregated_metric.clone().is_nan();
-                    aggregated_metric = aggregated_metric
-                        .clone()
-                        .select(0, nan_mask.bool_not().argwhere().squeeze(1))
-                }
-                aggregated_metric.mean()
-            }
-        };
-        avg_tensor.into_scalar().to_f64()
-    }
 }
 
-impl<B: Backend> Metric for PrecisionMetric<B> {
-    type Input = ConfusionStatsInput<B>;
+impl Metric for PrecisionMetric {
+    type Input = ConfusionStatsInput;
 
-    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> MetricEntry {
+    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
         let [sample_size, _] = input.predictions.dims();
 
-        let cf_stats = ConfusionStats::new(input, &self.config);
-        let metric =
-            self.class_average(cf_stats.clone().true_positive() / cf_stats.predicted_positive());
+        let stats = ConfusionStats::new(input, &self.config);
+        let tp = Some(stats.clone().true_positive());
+        let fp = Some(stats.clone().false_positive());
 
-        self.state.update(
-            100.0 * metric,
-            sample_size,
+        self.state.update(tp, fp, None, sample_size);
+        self.state.compute_update(
+            self.config.class_reduction,
             FormatOptions::new(self.name()).unit("%").precision(2),
+            |tp, fp, _| {
+                let (tp, fp) = (tp.unwrap(), fp.unwrap());
+                let denominator = tp.clone() + fp;
+                // Avoid division by zero on empty classes
+                let mask = denominator.clone().equal_elem(0.0);
+                let predicted_positive = denominator.mask_fill(mask, 1.0);
+
+                (tp / predicted_positive) * 100.0
+            },
         )
+    }
+
+    fn compute(&mut self) -> SerializedEntry {
+        self.state
+            .compute_final(FormatOptions::new(self.name()).unit("%").precision(2))
     }
 
     fn clear(&mut self) {
@@ -138,11 +122,27 @@ impl<B: Backend> Metric for PrecisionMetric<B> {
     fn name(&self) -> MetricName {
         self.name.clone()
     }
+
+    fn attributes(&self) -> MetricAttributes {
+        NumericAttributes {
+            unit: Some("%".to_string()),
+            higher_is_better: true,
+        }
+        .into()
+    }
 }
 
-impl<B: Backend> Numeric for PrecisionMetric<B> {
-    fn value(&self) -> super::NumericEntry {
-        self.state.value()
+impl Numeric for PrecisionMetric {
+    fn value(&self) -> Option<NumericEntry> {
+        self.state.current_value()
+    }
+
+    fn running_value(&self) -> Option<NumericEntry> {
+        self.state.running_value()
+    }
+
+    fn final_value(&self) -> NumericEntry {
+        self.state.final_value()
     }
 }
 
@@ -150,14 +150,12 @@ impl<B: Backend> Numeric for PrecisionMetric<B> {
 mod tests {
     use super::{
         ClassReduction::{self, *},
-        Metric, MetricMetadata, Numeric, PrecisionMetric,
+        Metric, MetricMetadata, PrecisionMetric,
     };
-    use crate::{
-        TestBackend,
-        tests::{ClassificationType, THRESHOLD, dummy_classification_input},
-    };
-    use burn_core::tensor::TensorData;
+    use crate::metric::{ConfusionStatsInput, Numeric};
+    use crate::tests::{ClassificationType, THRESHOLD, dummy_classification_input};
     use burn_core::tensor::Tolerance;
+    use burn_core::{Tensor, tensor::TensorData};
     use rstest::rstest;
 
     #[rstest]
@@ -166,7 +164,7 @@ mod tests {
         let input = dummy_classification_input(&ClassificationType::Binary).into();
         let mut metric = PrecisionMetric::binary(threshold);
         let _entry = metric.update(&input, &MetricMetadata::fake());
-        TensorData::from([metric.value().current()])
+        TensorData::from([metric.value().unwrap().current()])
             .assert_approx_eq::<f64>(&TensorData::from([expected * 100.0]), Tolerance::default())
     }
 
@@ -183,7 +181,7 @@ mod tests {
         let input = dummy_classification_input(&ClassificationType::Multiclass).into();
         let mut metric = PrecisionMetric::multiclass(top_k, class_reduction);
         let _entry = metric.update(&input, &MetricMetadata::fake());
-        TensorData::from([metric.value().current()])
+        TensorData::from([metric.value().unwrap().current()])
             .assert_approx_eq::<f64>(&TensorData::from([expected * 100.0]), Tolerance::default())
     }
 
@@ -198,21 +196,64 @@ mod tests {
         let input = dummy_classification_input(&ClassificationType::Multilabel).into();
         let mut metric = PrecisionMetric::multilabel(threshold, class_reduction);
         let _entry = metric.update(&input, &MetricMetadata::fake());
-        TensorData::from([metric.value().current()])
+        TensorData::from([metric.value().unwrap().current()])
             .assert_approx_eq::<f64>(&TensorData::from([expected * 100.0]), Tolerance::default())
     }
 
     #[test]
     fn test_parameterized_unique_name() {
-        let metric_a = PrecisionMetric::<TestBackend>::multiclass(1, ClassReduction::Macro);
-        let metric_b = PrecisionMetric::<TestBackend>::multiclass(2, ClassReduction::Macro);
-        let metric_c = PrecisionMetric::<TestBackend>::multiclass(1, ClassReduction::Macro);
+        let metric_a = PrecisionMetric::multiclass(1, ClassReduction::Macro);
+        let metric_b = PrecisionMetric::multiclass(2, ClassReduction::Macro);
+        let metric_c = PrecisionMetric::multiclass(1, ClassReduction::Macro);
 
         assert_ne!(metric_a.name(), metric_b.name());
         assert_eq!(metric_a.name(), metric_c.name());
 
-        let metric_a = PrecisionMetric::<TestBackend>::binary(0.5);
-        let metric_b = PrecisionMetric::<TestBackend>::binary(0.75);
+        let metric_a = PrecisionMetric::binary(0.5);
+        let metric_b = PrecisionMetric::binary(0.75);
         assert_ne!(metric_a.name(), metric_b.name());
+    }
+
+    #[test]
+    fn test_precision_global_aggregation() {
+        // Batch 1 (3 samples):
+        //   preds:   [[0.9], [0.8], [0.1]] -> binary threshold 0.5 -> [1, 1, 0]
+        //   targets: [1, 0, 0]             -> TP = 1, FP = 1 (denom = 2, Batch Precision = 50.0%)
+        //
+        // Batch 2 (6 samples):
+        //   preds:   [[0.9], [0.9], [0.9], [0.9], [0.9], [0.1]] -> binary threshold 0.5 -> [1, 1, 1, 1, 1, 0]
+        //   targets: [1, 0, 0, 0, 0, 0]                         -> TP = 1, FP = 4 (denom = 5, Batch Precision = 20.0%)
+        //
+        // Previously, using `NumericMetricState` would give a weighted average based on sample count N:
+        //   (3 * 50.0% + 6 * 20.0%) / (3 + 6) = 270 / 9 = 30.0% (incorrectly weighting by total samples N)
+        //
+        // Correct Global Aggregation = Total TP / Total (TP + FP) = (1 + 1) / (2 + 5) = 2 / 7 = 28.5714%
+
+        let mut metric = PrecisionMetric::binary(THRESHOLD);
+
+        // Batch 1
+        let input_batch1 = ConfusionStatsInput {
+            predictions: Tensor::from([[0.9], [0.8], [0.1]]),
+            targets: Tensor::from([[1], [0], [0]]),
+        };
+        let _ = metric.update(&input_batch1, &MetricMetadata::fake());
+
+        // Batch 2
+        let input_batch2 = ConfusionStatsInput {
+            predictions: Tensor::from([[0.9], [0.9], [0.9], [0.9], [0.9], [0.1]]),
+            targets: Tensor::from([[1], [0], [0], [0], [0], [0]]),
+        };
+        let _ = metric.update(&input_batch2, &MetricMetadata::fake());
+
+        // Compute final aggregated metric
+        let _final_entry = metric.compute();
+        let global_precision = metric.final_value().current();
+
+        let expected_global_precision = (2.0 / 7.0) * 100.0;
+
+        TensorData::from([global_precision]).assert_approx_eq::<f32>(
+            &TensorData::from([expected_global_precision]),
+            Tolerance::default(),
+        );
     }
 }

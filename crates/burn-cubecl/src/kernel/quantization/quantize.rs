@@ -1,28 +1,36 @@
-use crate::tensor::CubeTensor;
-use crate::{CubeRuntime, FloatElement, ops::empty_qtensor};
-use burn_tensor::quantization::QuantScheme;
+use crate::{ops::empty_qtensor_optimized, tensor::CubeTensor};
+use burn_backend::cubecl::dtype_to_elem_type;
+use burn_backend::{TensorMetadata, quantization::QuantScheme};
 
 /// Convert the tensor to a lower precision data type based on the quantization scheme and parameters.
-pub fn quantize<R, F>(
-    tensor: CubeTensor<R>,
+pub fn quantize(
+    tensor: CubeTensor,
     scheme: &QuantScheme,
-    scale: CubeTensor<R>,
-) -> CubeTensor<R>
-where
-    R: CubeRuntime,
-    F: FloatElement,
-{
-    let output = empty_qtensor(tensor.shape.clone(), *scheme, &tensor.device);
+    scale: CubeTensor,
+    global: Option<CubeTensor>,
+) -> CubeTensor {
+    let output = empty_qtensor_optimized(tensor.shape(), *scheme, &tensor.device);
     let (out_values, out_params) = output.clone().quantized_handles().unwrap();
+    let out_global = output.global();
+    let dtype = tensor.dtype;
 
-    cubecl_quant::quantize::launch_ref::<R, F>(
-        &tensor.client,
-        &tensor.as_handle_ref(),
-        &out_values.as_handle_ref(),
-        &scale.as_handle_ref(),
-        &out_params.as_handle_ref(),
+    // Innermost first: the block scales, then the per-tensor scale they are normalized against.
+    let mut scales = vec![scale.binding()];
+    scales.extend(global.map(|global| global.binding()));
+
+    let mut out_scales = vec![out_params.binding()];
+    out_scales.extend(out_global.map(|global| global.binding()));
+
+    cubek::quantization::quantize::launch_ref(
+        &output.client,
+        tensor.binding(),
+        out_values.binding(),
+        &scales,
+        &out_scales,
         scheme,
-    );
+        dtype_to_elem_type(dtype),
+    )
+    .expect("Kernel to never fail");
 
     output
 }

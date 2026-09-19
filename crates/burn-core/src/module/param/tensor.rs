@@ -1,38 +1,70 @@
-use super::{Param, ParamId, Parameter};
+use super::reparameterization_dyn::{self, DynReparameterization};
+use super::{Param, ParamId, Parameter, ParameterValue, Reparameterization};
 use crate::module::{
-    AutodiffModule, Content, Module, ModuleDisplay, ModuleDisplayDefault, ModuleMapper,
-    ModuleVisitor,
+    Content, Module, ModuleDisplay, ModuleDisplayDefault, ModuleMapper, ModuleVisitor,
 };
-use crate::tensor::{
-    Tensor,
-    backend::{AutodiffBackend, Backend},
-};
-use alloc::{format, string::ToString, vec::Vec};
-use burn_tensor::{Bool, Float, Int, TensorData, ops::Device};
+use alloc::{boxed::Box, format, string::ToString, vec::Vec};
+use burn_tensor::{Bool, Device, Float, Int, Tensor, TensorData};
 
-impl<B: Backend, const D: usize> Parameter for Tensor<B, D, Float> {
-    type Device = B::Device;
-
-    fn device(&self) -> Self::Device {
-        Tensor::device(self)
+impl<const D: usize> super::sealed::Sealed for Tensor<D, Float> {
+    fn is_active(&self) -> bool {
+        Tensor::is_require_grad(self)
     }
 
+    fn materialize(self, reparameterization: &dyn DynReparameterization) -> Self {
+        *reparameterization
+            .materialize_dyn(Box::new(self))
+            .downcast::<Tensor<D>>()
+            .expect("Reparameterization should preserve tensor rank")
+    }
+}
+impl<const D: usize> super::sealed::Sealed for Tensor<D, Int> {
+    fn is_active(&self) -> bool {
+        false
+    }
+}
+impl<const D: usize> super::sealed::Sealed for Tensor<D, Bool> {
+    fn is_active(&self) -> bool {
+        false
+    }
+}
+
+impl<const D: usize> ParameterValue for Tensor<D, Float> {}
+
+impl<const D: usize> Parameter for Tensor<D, Float> {
     fn is_require_grad(&self) -> bool {
         Tensor::is_require_grad(self)
     }
 
     fn set_require_grad(self, require_grad: bool) -> Self {
-        Tensor::set_require_grad(self, require_grad)
+        // Parameters keep their configured training state separately from the effective tensor.
+        if require_grad && !self.is_autodiff() {
+            self
+        } else {
+            Tensor::set_require_grad(self, require_grad)
+        }
     }
-}
 
-impl<B: Backend, const D: usize> Parameter for Tensor<B, D, Int> {
-    type Device = B::Device;
-
-    fn device(&self) -> Self::Device {
+    fn device(&self) -> Device {
         Tensor::device(self)
     }
 
+    fn shape(&self) -> burn_std::Shape {
+        Tensor::shape(self)
+    }
+
+    fn load_to_device(self, device: &Device) -> Self {
+        if self.device() != *device {
+            Tensor::to_device(self, device).detach()
+        } else {
+            self
+        }
+    }
+}
+
+impl<const D: usize> ParameterValue for Tensor<D, Int> {}
+
+impl<const D: usize> Parameter for Tensor<D, Int> {
     fn is_require_grad(&self) -> bool {
         false
     }
@@ -40,15 +72,27 @@ impl<B: Backend, const D: usize> Parameter for Tensor<B, D, Int> {
     fn set_require_grad(self, _require_grad: bool) -> Self {
         self
     }
-}
 
-impl<B: Backend, const D: usize> Parameter for Tensor<B, D, Bool> {
-    type Device = B::Device;
-
-    fn device(&self) -> Self::Device {
+    fn device(&self) -> Device {
         Tensor::device(self)
     }
 
+    fn shape(&self) -> burn_std::Shape {
+        Tensor::shape(self)
+    }
+
+    fn load_to_device(self, device: &Device) -> Self {
+        if self.device() != *device {
+            Tensor::to_device(self, device)
+        } else {
+            self
+        }
+    }
+}
+
+impl<const D: usize> ParameterValue for Tensor<D, Bool> {}
+
+impl<const D: usize> Parameter for Tensor<D, Bool> {
     fn is_require_grad(&self) -> bool {
         false
     }
@@ -56,83 +100,108 @@ impl<B: Backend, const D: usize> Parameter for Tensor<B, D, Bool> {
     fn set_require_grad(self, _require_grad: bool) -> Self {
         self
     }
+
+    fn device(&self) -> Device {
+        Tensor::device(self)
+    }
+
+    fn shape(&self) -> burn_std::Shape {
+        Tensor::shape(self)
+    }
+
+    fn load_to_device(self, device: &Device) -> Self {
+        if self.device() != *device {
+            Tensor::to_device(self, device)
+        } else {
+            self
+        }
+    }
 }
 
-impl<B: Backend, const D: usize> Param<Tensor<B, D>> {
-    /// Create a new parameter from a float tensor.
+impl<const D: usize> Param<Tensor<D>> {
+    /// Create a new trainable parameter from a float tensor.
     ///
     /// # Warnings
     ///
     /// We strongly recommend using [Param::uninitialized] if you are using this method to
     /// initialize parameters inside a module, since the tensor initialization will be lazy,
     /// making the loading of weights more performant.
-    pub fn from_tensor(value: Tensor<B, D>) -> Self {
-        // When creating a parameter from a float tensor, we automatically mark it as requiring
-        // gradients, so that it can be updated by an optimizer.
-        Param::initialized(ParamId::new(), value.require_grad())
+    pub fn from_tensor(value: Tensor<D>) -> Self {
+        // A plain backend can't activate gradients immediately, so record the setting explicitly
+        // for a later transition to training.
+        let mut param =
+            Param::initialized(ParamId::new(), Parameter::set_require_grad(value, true));
+        param.is_active = true;
+        param
     }
 
     /// Create a new parameter from data.
-    pub fn from_data<T>(data: T, device: &B::Device) -> Self
+    pub fn from_data<T>(data: T, device: &Device) -> Self
     where
         T: Into<TensorData>,
     {
-        // When creating a parameter from a float tensor, we automatically mark it as requiring
-        // gradients, so that it can be updated by an optimizer.
-        let value = Tensor::from_data(data, device);
-        Param::initialized(ParamId::new(), value.require_grad())
+        let data: TensorData = data.into();
+        // A plain backend can't activate gradients immediately, so record the setting explicitly
+        // for a later transition to training.
+        device.memory_persistent_allocations(data, |data| {
+            let value = Tensor::from_data(data, device);
+            let mut param =
+                Param::initialized(ParamId::new(), Parameter::set_require_grad(value, true));
+            param.is_active = true;
+            param
+        })
+    }
+
+    /// Attach a custom or built-in reparameterization, replacing any existing one.
+    pub(crate) fn with_reparameterization<R>(mut self, reparameterization: R) -> Self
+    where
+        R: Reparameterization,
+    {
+        self.reparameterization = Some(reparameterization_dyn::boxed::<R, D>(reparameterization));
+        self
     }
 }
 
-impl<const D: usize, B: Backend> Module<B> for Param<Tensor<B, D>> {
-    type Record = Param<Tensor<B, D>>;
-
-    fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V) {
-        visitor.visit_float(self.id, &self.val())
-    }
-
-    fn map<M: ModuleMapper<B>>(self, mapper: &mut M) -> Self {
-        let (id, tensor, _mapper) = self.consume();
-        let value = mapper.map_float(id, tensor);
-        Self::initialized(id, value)
-    }
-
-    fn into_record(self) -> Self::Record {
-        let (new_id, mut new_value, mapper) = self.consume();
-
-        new_value = mapper.on_save(new_value);
-
-        Self::initialized(new_id, new_value)
-    }
-
-    fn load_record(self, record: Self::Record) -> Self {
-        let (new_id, mut new_value, _mapper) = record.consume();
-        let mapper = self.record_mapper.clone();
-
-        let expected_device = self.lazy_device();
-        let expected_require_grad = self.lazy_is_require_grad();
-
-        // Make sure we load the record into the same module device.
-        if new_value.device() != expected_device {
-            new_value = new_value.to_device(&expected_device).detach();
+impl<const D: usize> Module for Param<Tensor<D>> {
+    fn visit<V: ModuleVisitor>(&self, visitor: &mut V) {
+        match self.reparameterization_dyn() {
+            None => visitor.visit_float(self),
+            Some(reparameterization) => {
+                visitor.visit_float(&self.without_reparameterization());
+                visitor.enter_module(reparameterization.name(), "Reparameterization");
+                reparameterization_dyn::visit(reparameterization, visitor);
+                visitor.exit_module(reparameterization.name(), "Reparameterization");
+            }
         }
-
-        new_value = mapper.on_load(new_value);
-
-        // Make sure we load the record with the same autodiff setting.
-        new_value = new_value.set_require_grad(expected_require_grad);
-
-        let mut loaded = Self::initialized(new_id, new_value);
-        loaded.record_mapper = mapper;
-        loaded
     }
 
-    fn to_device(self, device: &Device<B>) -> Self {
-        self.map(|tensor| tensor.to_device(device))
+    fn map<M: ModuleMapper>(mut self, mapper: &mut M) -> Self {
+        match self.reparameterization.take() {
+            None => mapper.map_float(self),
+            Some(reparameterization) => {
+                let base = mapper.map_float(self);
+                mapper.enter_module(reparameterization.name(), "Reparameterization");
+                let reparameterization = reparameterization_dyn::map(reparameterization, mapper);
+                mapper.exit_module(reparameterization.name(), "Reparameterization");
+                base.with_dyn_reparameterization(Some(reparameterization))
+            }
+        }
     }
 
-    fn fork(self, device: &Device<B>) -> Self {
-        self.map(|tensor| {
+    fn to_device(mut self, device: &Device) -> Self {
+        let reparameterization = self.reparameterization.take();
+        let base = self.map(|tensor| tensor.to_device(device));
+        match reparameterization {
+            None => base,
+            Some(reparameterization) => {
+                base.with_dyn_reparameterization(Some(reparameterization.to_device_dyn(device)))
+            }
+        }
+    }
+
+    fn fork(mut self, device: &Device) -> Self {
+        let reparameterization = self.reparameterization.take();
+        let base = self.map(|tensor| {
             let is_require_grad = tensor.is_require_grad();
             let mut tensor = tensor.to_device(device).detach();
 
@@ -141,21 +210,66 @@ impl<const D: usize, B: Backend> Module<B> for Param<Tensor<B, D>> {
             }
 
             tensor
-        })
+        });
+        match reparameterization {
+            None => base,
+            Some(reparameterization) => {
+                base.with_dyn_reparameterization(Some(reparameterization.fork_dyn(device)))
+            }
+        }
     }
 
-    fn collect_devices(&self, mut devices: Vec<Device<B>>) -> Vec<Device<B>> {
-        let device = self.val().device();
+    fn collect_devices(&self, mut devices: Vec<Device>) -> Vec<Device> {
+        let device = self.base().device();
 
         if !devices.contains(&device) {
             devices.push(device)
         }
 
+        if let Some(reparameterization) = self.reparameterization_dyn() {
+            devices = reparameterization.collect_devices_dyn(devices);
+        }
+
         devices
+    }
+
+    fn valid(&self) -> Self {
+        // Preserve whether the parameter was active, but reset the inner value's gradient state.
+        // `val()` folds any reparameterization into the base for inference.
+        //
+        // The param mapper crosses with it: it describes how the value relates to
+        // its *stored* form, which a change of backend does not alter. Dropping it
+        // makes `transform_for_save` the identity, so a record taken from a
+        // `valid()`ed module holds the in-memory shape rather than the checkpoint
+        // one — silently, for any layout that maps (a `Col` linear transposes).
+        let is_active = self.is_active;
+        let mut param = Param::from_mapped_value(
+            self.id,
+            self.val().without_autodiff().set_require_grad(false),
+            self.param_mapper.clone(),
+        );
+        param.is_active = is_active;
+        param
+    }
+
+    fn train(mut self) -> Self {
+        // Keep the reparameterization structure and its parameters on the autodiff backend.
+        let reparameterization = self.reparameterization.take();
+        // Reinstate the parameter's training state.
+        let is_active = self.is_active;
+        let tensor = Tensor::from_inner(self.val()).set_require_grad(is_active);
+        let mut base = Param::from_mapped_value(self.id, tensor, self.param_mapper);
+        base.is_active = is_active;
+        match reparameterization {
+            None => base,
+            Some(reparameterization) => {
+                base.with_dyn_reparameterization(Some(reparameterization.train_dyn()))
+            }
+        }
     }
 }
 
-impl<const D: usize, B: Backend> ModuleDisplayDefault for Param<Tensor<B, D>> {
+impl<const D: usize> ModuleDisplayDefault for Param<Tensor<D>> {
     fn content(&self, content: Content) -> Option<Content> {
         let id = if content.display_settings.show_param_id() {
             format!(", id: {}", self.id)
@@ -164,60 +278,31 @@ impl<const D: usize, B: Backend> ModuleDisplayDefault for Param<Tensor<B, D>> {
         };
         let string = format!(
             "ParamTensor {{rank: {D}, shape: {:?}, kind: float{id}}}",
-            self.shape().dims
+            self.shape().as_slice()
         );
         content.add_formatted(&string).optional()
     }
 }
-impl<const D: usize, B: Backend> ModuleDisplay for Param<Tensor<B, D>> {}
+impl<const D: usize> ModuleDisplay for Param<Tensor<D>> {}
 
-impl<const D: usize, B: Backend> Module<B> for Param<Tensor<B, D, Int>> {
-    type Record = Param<Tensor<B, D, Int>>;
-
-    fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V) {
-        visitor.visit_int(self.id, &self.val())
+impl<const D: usize> Module for Param<Tensor<D, Int>> {
+    fn visit<V: ModuleVisitor>(&self, visitor: &mut V) {
+        visitor.visit_int(self)
     }
 
-    fn map<M: ModuleMapper<B>>(self, mapper: &mut M) -> Self {
-        let value = mapper.map_int(self.id, self.val());
-        Self::initialized(self.id, value)
+    fn map<M: ModuleMapper>(self, mapper: &mut M) -> Self {
+        mapper.map_int(self)
     }
 
-    fn into_record(self) -> Self::Record {
-        let (new_id, mut new_value, mapper) = self.consume();
-
-        new_value = mapper.on_save(new_value);
-
-        Self::initialized(new_id, new_value)
-    }
-
-    fn load_record(self, record: Self::Record) -> Self {
-        let (new_id, mut new_value, _mapper) = record.consume();
-        let mapper = self.record_mapper.clone();
-
-        let expected_device = self.lazy_device();
-
-        // Make sure we load the record into the same module device.
-        if new_value.device() != expected_device {
-            new_value = new_value.to_device(&expected_device);
-        }
-
-        new_value = mapper.on_load(new_value);
-
-        let mut loaded = Self::initialized(new_id, new_value);
-        loaded.record_mapper = mapper;
-        loaded
-    }
-
-    fn to_device(self, device: &Device<B>) -> Self {
+    fn to_device(self, device: &Device) -> Self {
         self.map(|tensor| tensor.to_device(device))
     }
 
-    fn fork(self, device: &Device<B>) -> Self {
+    fn fork(self, device: &Device) -> Self {
         self.to_device(device) // Don't support autodiff.
     }
 
-    fn collect_devices(&self, mut devices: Vec<Device<B>>) -> Vec<Device<B>> {
+    fn collect_devices(&self, mut devices: Vec<Device>) -> Vec<Device> {
         let device = self.val().device();
 
         if !devices.contains(&device) {
@@ -226,9 +311,21 @@ impl<const D: usize, B: Backend> Module<B> for Param<Tensor<B, D, Int>> {
 
         devices
     }
+
+    fn valid(&self) -> Self {
+        Param::from_mapped_value(
+            self.id,
+            self.val().without_autodiff(),
+            self.param_mapper.clone(),
+        )
+    }
+
+    fn train(self) -> Self {
+        Param::from_mapped_value(self.id, Tensor::from_inner(self.val()), self.param_mapper)
+    }
 }
 
-impl<const D: usize, B: Backend> ModuleDisplayDefault for Param<Tensor<B, D, Int>> {
+impl<const D: usize> ModuleDisplayDefault for Param<Tensor<D, Int>> {
     fn content(&self, content: Content) -> Option<Content> {
         let id = if content.display_settings.show_param_id() {
             format!(", id: {}", self.id)
@@ -237,60 +334,31 @@ impl<const D: usize, B: Backend> ModuleDisplayDefault for Param<Tensor<B, D, Int
         };
         let string = format!(
             "ParamTensor {{rank: {D}, shape: {:?}, kind: int{id}}}",
-            self.shape().dims
+            self.shape().as_slice()
         );
         content.add_formatted(&string).optional()
     }
 }
-impl<const D: usize, B: Backend> ModuleDisplay for Param<Tensor<B, D, Int>> {}
+impl<const D: usize> ModuleDisplay for Param<Tensor<D, Int>> {}
 
-impl<const D: usize, B: Backend> Module<B> for Param<Tensor<B, D, Bool>> {
-    type Record = Param<Tensor<B, D, Bool>>;
-
-    fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V) {
-        visitor.visit_bool(self.id, &self.val())
+impl<const D: usize> Module for Param<Tensor<D, Bool>> {
+    fn visit<V: ModuleVisitor>(&self, visitor: &mut V) {
+        visitor.visit_bool(self)
     }
 
-    fn map<M: ModuleMapper<B>>(self, mapper: &mut M) -> Self {
-        let value = mapper.map_bool(self.id, self.val());
-        Self::initialized(self.id, value)
+    fn map<M: ModuleMapper>(self, mapper: &mut M) -> Self {
+        mapper.map_bool(self)
     }
 
-    fn into_record(self) -> Self::Record {
-        let (new_id, mut new_value, mapper) = self.consume();
-
-        new_value = mapper.on_save(new_value);
-
-        Self::initialized(new_id, new_value)
-    }
-
-    fn load_record(self, record: Self::Record) -> Self {
-        let (new_id, mut new_value, _mapper) = record.consume();
-        let mapper = self.record_mapper.clone();
-
-        let expected_device = self.lazy_device();
-
-        // Make sure we load the record into the same module device.
-        if new_value.device() != expected_device {
-            new_value = new_value.to_device(&expected_device);
-        }
-
-        new_value = mapper.on_load(new_value);
-
-        let mut loaded = Self::initialized(new_id, new_value);
-        loaded.record_mapper = mapper;
-        loaded
-    }
-
-    fn to_device(self, device: &Device<B>) -> Self {
+    fn to_device(self, device: &Device) -> Self {
         self.map(|tensor| tensor.to_device(device))
     }
 
-    fn fork(self, device: &Device<B>) -> Self {
+    fn fork(self, device: &Device) -> Self {
         self.to_device(device) // Don't support autodiff.
     }
 
-    fn collect_devices(&self, mut devices: Vec<Device<B>>) -> Vec<Device<B>> {
+    fn collect_devices(&self, mut devices: Vec<Device>) -> Vec<Device> {
         let device = self.val().device();
 
         if !devices.contains(&device) {
@@ -299,9 +367,21 @@ impl<const D: usize, B: Backend> Module<B> for Param<Tensor<B, D, Bool>> {
 
         devices
     }
+
+    fn valid(&self) -> Self {
+        Param::from_mapped_value(
+            self.id,
+            self.val().without_autodiff(),
+            self.param_mapper.clone(),
+        )
+    }
+
+    fn train(self) -> Self {
+        Param::from_mapped_value(self.id, Tensor::from_inner(self.val()), self.param_mapper)
+    }
 }
 
-impl<const D: usize, B: Backend> ModuleDisplayDefault for Param<Tensor<B, D, Bool>> {
+impl<const D: usize> ModuleDisplayDefault for Param<Tensor<D, Bool>> {
     fn content(&self, content: Content) -> Option<Content> {
         let id = if content.display_settings.show_param_id() {
             format!(", id: {}", self.id)
@@ -311,70 +391,198 @@ impl<const D: usize, B: Backend> ModuleDisplayDefault for Param<Tensor<B, D, Boo
 
         let string = format!(
             "ParamTensor {{rank: {D}, shape: {:?}, kind: bool{id}}}",
-            self.shape().dims
+            self.shape().as_slice()
         );
         content.add_formatted(&string).optional()
     }
 }
 
-impl<const D: usize, B: Backend> ModuleDisplay for Param<Tensor<B, D, Bool>> {}
+impl<const D: usize> ModuleDisplay for Param<Tensor<D, Bool>> {}
 
-impl<const D: usize, B: AutodiffBackend> AutodiffModule<B> for Param<Tensor<B, D>> {
-    type InnerModule = Param<Tensor<B::InnerBackend, D>>;
-
-    fn valid(&self) -> Self::InnerModule {
-        Param::initialized(self.id, self.val().inner().set_require_grad(false))
-    }
-}
-
-impl<const D: usize, B: AutodiffBackend> AutodiffModule<B> for Param<Tensor<B, D, Int>> {
-    type InnerModule = Param<Tensor<B::InnerBackend, D, Int>>;
-
-    fn valid(&self) -> Self::InnerModule {
-        Param::initialized(self.id, self.val().inner())
-    }
-}
-
-impl<const D: usize, B: AutodiffBackend> AutodiffModule<B> for Param<Tensor<B, D, Bool>> {
-    type InnerModule = Param<Tensor<B::InnerBackend, D, Bool>>;
-
-    fn valid(&self) -> Self::InnerModule {
-        Param::initialized(self.id, self.val().inner())
-    }
-}
-
-#[cfg(all(test, feature = "std"))]
+#[cfg(all(test, feature = "std", feature = "autodiff"))]
 mod tests {
     use super::*;
-    use crate::{
-        TestAutodiffBackend,
-        module::Module,
-        record::{BinBytesRecorder, FullPrecisionSettings, Recorder},
-    };
+    use crate::{module::Module, test_device};
 
     #[test]
-    fn test_load_record_setting() {
-        let device = Default::default();
-        let tensor = Tensor::<TestAutodiffBackend, 2>::ones([3, 3], &device).require_grad();
+    fn set_require_grad_updates_lazy_lifecycle_state() {
+        let device = test_device().autodiff();
+        let param: Param<Tensor<2>> = Param::uninitialized(
+            ParamId::new(),
+            |device, require_grad| Tensor::ones([2, 3], device).set_require_grad(require_grad),
+            device,
+            true,
+            [2, 3].into(),
+        );
 
-        let byte_recorder = BinBytesRecorder::<FullPrecisionSettings>::default();
-        let bytes = byte_recorder
-            .record(
-                Param::initialized(ParamId::new(), tensor.clone()).into_record(),
-                (),
-            )
-            .unwrap();
+        let param = param.set_require_grad(false);
 
-        let no_grad_is_require_grad = Param::initialized(ParamId::new(), tensor.clone())
-            .no_grad()
-            .load_record(byte_recorder.load(bytes.clone(), &device).unwrap())
-            .is_require_grad();
+        assert!(!param.is_initialized());
+        assert!(!param.is_active);
+        assert!(!param.val().is_require_grad());
 
-        let with_default_is_require_grad = Param::initialized(ParamId::new(), tensor)
-            .load_record(byte_recorder.load(bytes, &device).unwrap())
-            .is_require_grad();
+        let param = param.valid().train();
 
-        assert!(!no_grad_is_require_grad);
-        assert!(with_default_is_require_grad);
+        assert!(!param.is_require_grad());
+        assert!(!param.is_active);
+    }
+
+    #[test]
+    fn set_require_grad_on_a_plain_tensor_is_applied_by_train() {
+        let device = test_device();
+        let param = Param::initialized(
+            ParamId::new(),
+            Tensor::<2>::ones([2, 3], &device).set_require_grad(false),
+        )
+        .set_require_grad(true);
+
+        assert!(!param.is_require_grad());
+        assert!(param.is_active);
+
+        let param = param.train();
+
+        assert!(param.is_require_grad());
+        assert!(param.is_active);
+    }
+
+    #[test]
+    fn trainable_param_created_on_a_plain_device_is_applied_by_train() {
+        let device = test_device();
+        let param = Param::from_tensor(Tensor::<2>::ones([2, 3], &device));
+
+        assert!(!param.is_require_grad());
+        assert!(param.is_active);
+
+        let param = param.train();
+
+        assert!(param.is_require_grad());
+        assert!(param.is_active);
+    }
+
+    #[test]
+    fn lazy_activation_setting_on_a_plain_device_is_applied_by_train() {
+        let device = test_device();
+        let param: Param<Tensor<2>> = Param::uninitialized(
+            ParamId::new(),
+            |device, require_grad| Tensor::ones([2, 3], device).set_require_grad(require_grad),
+            device,
+            false,
+            [2, 3].into(),
+        )
+        .set_require_grad(true);
+
+        assert!(!param.is_initialized());
+        assert!(param.is_active);
+        assert!(!param.val().is_require_grad());
+
+        let param = param.train();
+
+        assert!(param.is_require_grad());
+        assert!(param.is_active);
+    }
+
+    #[test]
+    fn mapping_a_validation_param_preserves_what_train_restores() {
+        let device = test_device().autodiff();
+        let param = Param::from_tensor(Tensor::<2>::ones([2, 3], &device))
+            .valid()
+            .map(|tensor| tensor);
+
+        assert!(!param.is_require_grad());
+        assert!(param.is_active);
+
+        let param = param.train();
+
+        assert!(param.is_require_grad());
+        assert!(param.is_active);
+    }
+
+    #[test]
+    fn mapped_value_reconstruction_preserves_what_train_restores() {
+        let device = test_device().autodiff();
+        let valid = Param::from_tensor(Tensor::<2>::ones([2, 3], &device)).valid();
+        let (id, tensor, mapper) = valid.consume();
+
+        let param = Param::from_mapped_value(id, tensor, mapper);
+
+        assert!(!param.is_require_grad());
+        assert!(param.is_active);
+
+        let param = param.train();
+
+        assert!(param.is_require_grad());
+        assert!(param.is_active);
+    }
+
+    #[test]
+    fn loading_a_validation_param_preserves_what_train_restores() {
+        let device = test_device().autodiff();
+        let valid = Param::from_tensor(Tensor::<2>::ones([2, 3], &device)).valid();
+        let record = Tensor::<2>::zeros([2, 3], &test_device());
+
+        let param = valid.transform_for_load(record, ParamId::new());
+
+        assert!(!param.is_require_grad());
+        assert!(param.is_active);
+
+        let param = param.train();
+
+        assert!(param.is_require_grad());
+        assert!(param.is_active);
+    }
+
+    #[test]
+    fn test_param_require_grad_stateful() {
+        let device = test_device().autodiff();
+        let tensor = Tensor::<2>::ones([3, 3], &device).require_grad();
+
+        let param = Param::initialized(ParamId::new(), tensor);
+        assert!(param.is_require_grad());
+        assert!(param.is_active);
+
+        let param = param.valid();
+        assert!(!param.is_require_grad());
+        assert!(param.is_active); // stateful
+
+        let param = param.train();
+        assert!(param.is_require_grad());
+        assert!(param.is_active); // stateful
+
+        let param = param.no_grad();
+        assert!(!param.is_require_grad());
+        assert!(!param.is_active); // stateful
+
+        let param = param.valid();
+        assert!(!param.is_require_grad()); // always
+        assert!(!param.is_active); // stateful
+
+        let param = param.train();
+        assert!(!param.is_require_grad());
+        assert!(!param.is_active); // stateful
+    }
+
+    #[test]
+    fn a_lazy_param_with_an_init_mapper_trains_on_an_autodiff_device() {
+        let device = test_device().autodiff();
+        let param: Param<Tensor<2>> = Param::uninitialized(
+            ParamId::new(),
+            |device, require_grad| Tensor::ones([2, 3], device).set_require_grad(require_grad),
+            device,
+            true,
+            [2, 3].into(),
+        )
+        .init_mapper(|tensor| tensor.mul_scalar(2.0));
+
+        let value = param.val();
+        let grads = value.clone().sum().backward();
+
+        value
+            .into_data()
+            .assert_eq(&TensorData::from([[2.0f32; 3]; 2]), false);
+        param
+            .grad(&grads)
+            .expect("the mapped value is the leaf that receives the gradient")
+            .into_data()
+            .assert_eq(&TensorData::from([[1.0f32; 3]; 2]), false);
     }
 }

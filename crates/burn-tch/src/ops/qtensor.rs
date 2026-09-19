@@ -1,14 +1,13 @@
-use std::ops::Range;
-
-use burn_tensor::{
-    Shape, TensorData,
-    ops::{FloatTensor, IntTensor, QTensorOps, QuantizedTensor},
+use burn_backend::{
+    ExecutionError, FloatDType, IntDType, Shape, TensorData,
+    ops::QTensorOps,
     quantization::{QuantScheme, QuantizationParametersPrimitive},
+    tensor::{Device, FloatTensor, IntTensor, QuantizedTensor},
 };
 
-use crate::{LibTorch, LibTorchDevice, TchElement};
+use crate::{LibTorch, LibTorchDevice};
 
-impl<E: TchElement> QTensorOps<Self> for LibTorch<E> {
+impl QTensorOps<Self> for LibTorch {
     fn q_from_data(_data: TensorData, _device: &LibTorchDevice) -> QuantizedTensor<Self> {
         unimplemented!()
     }
@@ -28,17 +27,13 @@ impl<E: TchElement> QTensorOps<Self> for LibTorch<E> {
         unimplemented!()
     }
 
-    fn dequantize(_tensor: QuantizedTensor<Self>) -> FloatTensor<Self> {
-        unimplemented!()
-    }
-
-    fn q_device(_tensor: &QuantizedTensor<Self>) -> LibTorchDevice {
+    fn dequantize(_tensor: QuantizedTensor<Self>, _dtype: FloatDType) -> FloatTensor<Self> {
         unimplemented!()
     }
 
     fn q_to_device(
         _tensor: QuantizedTensor<Self>,
-        _device: &burn_tensor::Device<Self>,
+        _device: &Device<Self>,
     ) -> QuantizedTensor<Self> {
         unimplemented!()
     }
@@ -47,7 +42,7 @@ impl<E: TchElement> QTensorOps<Self> for LibTorch<E> {
         unimplemented!()
     }
 
-    async fn q_into_data(_tensor: QuantizedTensor<Self>) -> TensorData {
+    async fn q_into_data(_tensor: QuantizedTensor<Self>) -> Result<TensorData, ExecutionError> {
         unimplemented!()
     }
     fn q_swap_dims(
@@ -66,29 +61,26 @@ impl<E: TchElement> QTensorOps<Self> for LibTorch<E> {
         unimplemented!()
     }
 
-    fn q_select(
+    fn q_argmax(
         _tensor: QuantizedTensor<Self>,
         _dim: usize,
-        _indices: IntTensor<Self>,
-    ) -> QuantizedTensor<Self> {
+        _out_dtype: IntDType,
+    ) -> IntTensor<Self> {
         unimplemented!()
     }
 
-    fn q_slice(_tensor: QuantizedTensor<Self>, _ranges: &[Range<usize>]) -> QuantizedTensor<Self> {
-        unimplemented!()
-    }
-
-    fn q_argmax(_tensor: QuantizedTensor<Self>, _dim: usize) -> IntTensor<Self> {
-        unimplemented!()
-    }
-
-    fn q_argmin(_tensor: QuantizedTensor<Self>, _dim: usize) -> IntTensor<Self> {
+    fn q_argmin(
+        _tensor: QuantizedTensor<Self>,
+        _dim: usize,
+        _out_dtype: IntDType,
+    ) -> IntTensor<Self> {
         unimplemented!()
     }
 
     fn q_max_dim_with_indices(
         _tensor: QuantizedTensor<Self>,
         _dim: usize,
+        _indices_dtype: IntDType,
     ) -> (QuantizedTensor<Self>, IntTensor<Self>) {
         unimplemented!()
     }
@@ -104,11 +96,8 @@ impl<E: TchElement> QTensorOps<Self> for LibTorch<E> {
     fn q_min_dim_with_indices(
         _tensor: QuantizedTensor<Self>,
         _dim: usize,
+        _indices_dtype: IntDType,
     ) -> (QuantizedTensor<Self>, IntTensor<Self>) {
-        unimplemented!()
-    }
-
-    fn q_expand(_tensor: QuantizedTensor<Self>, _shape: Shape) -> QuantizedTensor<Self> {
         unimplemented!()
     }
 
@@ -124,6 +113,7 @@ impl<E: TchElement> QTensorOps<Self> for LibTorch<E> {
         _tensor: QuantizedTensor<Self>,
         _dim: usize,
         _descending: bool,
+        _indices_dtype: IntDType,
     ) -> (QuantizedTensor<Self>, IntTensor<Self>) {
         unimplemented!()
     }
@@ -132,6 +122,7 @@ impl<E: TchElement> QTensorOps<Self> for LibTorch<E> {
         _tensor: QuantizedTensor<Self>,
         _dim: usize,
         _descending: bool,
+        _out_dtype: IntDType,
     ) -> IntTensor<Self> {
         unimplemented!()
     }
